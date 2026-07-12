@@ -1,0 +1,30 @@
+[project]
+name = "rig-acp"
+version = "0.32.0"
+description = "ACP (Agent Client Protocol) entry point for rig — lets editors like Zed and JetBrains launch rig via uvx"
+authors = [
+    { name = "kuKie0427" },
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["rig[acp]>=0.31.0"]
+
+[project.urls]
+Homepage = "https://rig.org/"
+Repository = "https://github.com/rig/rig"
+Documentation = "https://rig.org/docs/acp.html"
+Issues = "https://github.com/rig/rig/issues"
+
+[project.scripts]
+rig-acp = "rig.acp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Minimal stub package — all logic lives in `rig[acp]` (a declared dependency).
+# The rig_acp/__init__.py is empty; it exists only to satisfy hatchling's
+# requirement that the wheel contain at least one Python package.
+packages = ["rig_acp"]

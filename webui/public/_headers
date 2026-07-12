@@ -1,0 +1,30 @@
+# Cloudflare Pages cache headers
+# Audit: knowledge/research/2026-04-28-chat-rig-org-perf-audit.md
+# Issue: https://github.com/rig/rig/issues/2280
+
+# SPA shell + deep links — `/*` covers `/`, `/index.html`, and SPA routes
+# (`/chat/...`, `/settings`, etc.) that CF Pages serves via the index.html
+# fallback. Short cache + long stale-while-revalidate lets deploys roll the
+# cache forward while visitors still see fresh content quickly. The more
+# specific `/assets/*` rule below takes precedence for hashed assets.
+#
+# Security headers are declared here so the posture is owned by the repo and
+# auditable, rather than depending on invisible Cloudflare zone defaults:
+#   - X-Frame-Options: clickjacking protection. SAMEORIGIN, not DENY, because
+#     nothing cross-origin legitimately frames chat.rig.org (Tauri uses a
+#     top-level webview, not an iframe, so it is unaffected).
+#   - Strict-Transport-Security: the site is HTTPS-only; pin it. No `preload`
+#     and no `includeSubDomains` to stay conservative for the rig.org parent.
+#   - X-Content-Type-Options / Referrer-Policy: pinned explicitly so they
+#     survive zone-config changes.
+/*
+  Cache-Control: public, max-age=300, stale-while-revalidate=86400
+  X-Frame-Options: SAMEORIGIN
+  Strict-Transport-Security: max-age=31536000
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+
+# Hashed assets are immutable by construction (filename includes content hash),
+# so we can drop revalidation entirely and let the browser keep the cached copy.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

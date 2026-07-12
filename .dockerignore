@@ -1,0 +1,84 @@
+# Environment files
+.env*
+.clean
+rig.toml
+
+venv
+.venv
+
+# worktrees
+dev
+
+# Logs
+*.log
+*logs*
+
+# Outputs
+build
+outputs
+screenshot_*
+
+# Build scripts
+scripts
+!scripts/computer_home
+.github
+
+# Build/test/coverage/docs/prof directories
+dist
+tests
+tests/output
+junit.xml
+.coverage
+coverage.xml
+htmlcov
+prof
+
+# cache
+__pycache__
+.*cache
+
+# docs/demos/projects/evals
+docs
+demos
+projects
+eval_results*
+
+# Frontend / desktop / static-site sources — not needed by either image.
+# The agent image (scripts/Dockerfile) copies only pyproject/rig explicitly;
+# the self-host image (scripts/Dockerfile.selfhost) only pip-installs the
+# package. tauri (~8G) and webui (~600M) would otherwise bloat the build context.
+webui
+tauri
+site
+
+# Specific filetypes
+*.csv
+*.jsonl
+*.gif
+*.cast
+*.png
+
+# Docker-specific excludes
+Dockerfile
+Dockerfile.eval
+docker-compose.yml
+
+# Git directory
+.git
+
+# Python bytecode
+*.pyc
+*.pyo
+*.pyd
+
+# Editor directories
+.vscode
+.idea
+
+# Keep these files/directories
+!pyproject.toml
+!poetry.lock
+!README.md
+!rig
+!static
+!media

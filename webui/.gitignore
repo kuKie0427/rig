@@ -1,0 +1,37 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Playwright local test output
+test-results/
+playwright-report/
+blob-report/
+
+# bun is not a supported install path for webui (see #2277).
+# Cloudflare Pages prefers bun when bun.lockb exists, which resolves
+# different package versions than package-lock.json and breaks the
+# preview build. Ignore the lockfile so a stray local `bun install`
+# can't silently re-break CF Pages.
+bun.lockb
+bun.lock
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

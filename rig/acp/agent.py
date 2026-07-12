@@ -1,0 +1,1468 @@
+"""ACP Agent implementation for rig.
+
+This module implements the Agent Client Protocol, allowing rig to be used
+as a coding agent from any ACP-compatible editor (Zed, JetBrains, etc.).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import hashlib
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from ..config import ChatConfig, get_project_config
+from ..dirs import get_logs_dir
+from ..init import init
+from ..llm.models import get_default_model, set_default_model
+from ..logmanager import LogManager, list_conversations
+from ..prompts import get_prompt
+from ..session import SessionRegistry
+from ..tools import get_tools, set_tools
+from ..util.auto_naming import generate_conversation_id
+from ..util.context import md_codeblock
+from .adapter import acp_content_to_rig_message, rig_message_to_acp_content
+from .types import (
+    PermissionKind,
+    PermissionOption,
+    ToolCall,
+    ToolCallStatus,
+    rig_tool_to_acp_kind,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
+    from ..message import Message
+
+logger = logging.getLogger(__name__)
+
+# Lazy imports to avoid dependency issues when acp is not installed
+Agent: type | None = None
+Implementation: type | None = None
+InitializeResponse: type | None = None
+NewSessionResponse: type | None = None
+PromptResponse: type | None = None
+Client: type | None = None
+
+
+def _check_acp_import(cls: type | None, name: str) -> type:
+    """Verify a lazy-imported ACP class is available.
+
+    Uses explicit check instead of assert, which can be disabled with python -O.
+    See also: server/api_v2.py for the same pattern.
+    """
+    if cls is None:
+        raise RuntimeError(
+            f"ACP class {name} not imported; is the 'acp' package installed?"
+        )
+    return cls
+
+
+def _import_acp() -> bool:
+    """Import ACP modules lazily."""
+    global \
+        Agent, \
+        Implementation, \
+        InitializeResponse, \
+        NewSessionResponse, \
+        PromptResponse, \
+        Client
+    try:
+        from acp import (
+            Agent as _Agent,
+        )
+        from acp import (
+            InitializeResponse as _InitializeResponse,
+        )
+        from acp import (
+            NewSessionResponse as _NewSessionResponse,
+        )
+        from acp import (
+            PromptResponse as _PromptResponse,
+        )
+        from acp.interfaces import Client as _Client
+        from acp.schema import (
+            Implementation as _Implementation,
+        )
+
+        Agent = _Agent
+        Implementation = _Implementation
+        InitializeResponse = _InitializeResponse
+        NewSessionResponse = _NewSessionResponse
+        PromptResponse = _PromptResponse
+        Client = _Client
+        return True
+    except ImportError:
+        return False
+
+
+def _agent_info() -> Any:
+    """Build the agentInfo for InitializeResponse."""
+    _Impl = _check_acp_import(Implementation, "Implementation")
+    try:
+        from importlib.metadata import version
+
+        rig_version = version("rig")
+    except Exception:
+        rig_version = "unknown"
+    return _Impl(name="rig", title="rig ACP Agent", version=rig_version)
+
+
+def _cwd_session_id(cwd: str) -> str:
+    """Derive a deterministic session ID from a workspace path.
+
+    Returns a stable ID like ``acp-<hash8>`` so that the same CWD always
+    maps to the same session, enabling session resume across editor restarts.
+    """
+    h = hashlib.sha256(str(Path(cwd).resolve()).encode()).hexdigest()[:8]
+    return f"acp-{h}"
+
+
+class RigAgent:
+    """ACP-compatible agent wrapping rig functionality.
+
+    This agent responds to prompts from ACP-compatible clients (like Zed)
+    and executes them using rig's chat infrastructure.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the rig agent."""
+        self._conn: Any = None
+        self._registry = SessionRegistry()
+        self._initialized = False
+        self._init_error: str | None = None
+        self._model: str | None = None
+        self._tools: list[Any] | None = None
+        # Per-session model overrides (populated from per-project rig.toml)
+        self._session_models: dict[str, str | None] = {}
+        # Per-session mode (default: "default", can be "auto" for no-confirm)
+        self._session_modes: dict[str, str] = {}
+        # Phase 2: Track active tool calls per session
+        self._tool_calls: dict[str, dict[str, ToolCall]] = {}
+        # Phase 2: Permission policies per session (allow_always, reject_always)
+        self._permission_policies: dict[str, dict[str, str]] = {}
+        # Track sessions where AvailableCommandsUpdate was successfully sent.
+        # Used to deduplicate sends between _send_session_open_notifications()
+        # and the prompt() fallback (in case the deferred notification races
+        # with an early first prompt).
+        self._session_commands_advertised: set[str] = set()
+        # Background tasks that must be kept alive until completion.
+        # Without storing references, asyncio.create_task() returns tasks that
+        # can be garbage-collected and silently cancelled before finishing.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def on_connect(self, conn: Any) -> None:
+        """Called when a client connects.
+
+        Args:
+            conn: The client connection for sending notifications.
+        """
+        self._conn = conn
+
+    def _create_background_task(
+        self, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task[None]:
+        """Create a background task with a stored reference to prevent GC cancellation."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    # Phase 2: Tool call methods
+
+    async def _report_tool_call(
+        self,
+        session_id: str,
+        tool_call: ToolCall,
+    ) -> None:
+        """Report a tool call to the client via session/update.
+
+        Args:
+            session_id: The session ID
+            tool_call: The tool call to report
+        """
+        if not self._conn:
+            logger.warning("No connection to report tool call")
+            return
+
+        # Store tool call
+        if session_id not in self._tool_calls:
+            self._tool_calls[session_id] = {}
+        self._tool_calls[session_id][tool_call.tool_call_id] = tool_call
+
+        await self._conn.session_update(
+            session_id=session_id,
+            update=tool_call.to_dict(),
+            source="rig",
+        )
+
+    async def _update_tool_call(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        status: ToolCallStatus,
+        content: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Update a tool call status via session/update.
+
+        Args:
+            session_id: The session ID
+            tool_call_id: The tool call ID to update
+            status: New status
+            content: Optional content to add
+        """
+        if not self._conn:
+            return
+
+        # Update stored tool call
+        if session_id in self._tool_calls:
+            if tool_call_id in self._tool_calls[session_id]:
+                tc = self._tool_calls[session_id][tool_call_id]
+                tc.status = status
+                if content:
+                    tc.content = content
+
+        update: dict[str, Any] = {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": status.value,
+        }
+        if content:
+            update["content"] = content
+
+        await self._conn.session_update(
+            session_id=session_id,
+            update=update,
+            source="rig",
+        )
+
+    async def _request_tool_permission(
+        self,
+        session_id: str,
+        tool_call: ToolCall,
+    ) -> bool:
+        """Request permission to execute a tool call.
+
+        Args:
+            session_id: The session ID
+            tool_call: The tool call requiring permission
+
+        Returns:
+            True if permission granted, False otherwise
+        """
+        if not self._conn:
+            # No connection - auto-allow for backward compatibility
+            return True
+
+        # In "auto" mode, skip permission prompts (like --no-confirm)
+        if self._session_modes.get(session_id) == "auto":
+            logger.debug(
+                f"Auto-approving {tool_call.kind.value} in auto mode "
+                f"(session={session_id})"
+            )
+            return True
+
+        # Check cached permission policies
+        if session_id in self._permission_policies:
+            policies = self._permission_policies[session_id]
+            tool_key = tool_call.kind.value
+            if tool_key in policies:
+                return policies[tool_key] == "allow"
+
+        # Request permission from client
+        try:
+            options = [
+                PermissionOption(
+                    option_id="allow-once",
+                    name="Allow once",
+                    kind=PermissionKind.ALLOW_ONCE,
+                ),
+                PermissionOption(
+                    option_id="allow-always",
+                    name="Allow always",
+                    kind=PermissionKind.ALLOW_ALWAYS,
+                ),
+                PermissionOption(
+                    option_id="reject-once",
+                    name="Reject",
+                    kind=PermissionKind.REJECT_ONCE,
+                ),
+                PermissionOption(
+                    option_id="reject-always",
+                    name="Reject always",
+                    kind=PermissionKind.REJECT_ALWAYS,
+                ),
+            ]
+
+            result = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call={"toolCallId": tool_call.tool_call_id},
+                options=[opt.to_dict() for opt in options],
+            )
+
+            outcome = result.outcome
+            if outcome.outcome == "cancelled":
+                return False
+
+            option_id = outcome.option_id
+
+            # Cache always policies
+            if option_id in ("allow-always", "reject-always"):
+                policies = self._permission_policies.setdefault(session_id, {})
+                policies[tool_call.kind.value] = (
+                    "allow" if option_id == "allow-always" else "reject"
+                )
+                return option_id == "allow-always"
+            return option_id == "allow-once"
+
+        except Exception as e:
+            logger.warning("Permission request failed: %s, denying for safety", e)
+            return False
+
+    def _create_confirm_with_tools(
+        self,
+        session_id: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        """Create a confirm callback that reports tool calls.
+
+        Args:
+            session_id: The session ID
+            loop: The event loop for async operations
+
+        Returns:
+            A confirm callback function
+        """
+
+        def confirm_callback(msg: str) -> bool:
+            """Confirm callback that reports tool calls to ACP client."""
+            # Parse tool name from confirmation message patterns
+            # rig tools use various formats, so we pattern-match common ones
+            tool_name = "unknown"
+            content_preview = msg[:100]
+
+            # Map confirmation message patterns to tool names
+            msg_lower = msg.lower()
+            if "run command" in msg_lower:
+                tool_name = "shell"
+            elif "execute this code" in msg_lower:
+                tool_name = "python"
+            elif "execute commands" in msg_lower:
+                tool_name = "tmux"
+            elif "apply patch" in msg_lower:
+                tool_name = "patch"
+            elif "save to" in msg_lower or "overwrite" in msg_lower:
+                tool_name = "save"
+            elif "append to" in msg_lower:
+                tool_name = "append"
+            elif "create" in msg_lower and (
+                "file" in msg_lower or "folder" in msg_lower
+            ):
+                tool_name = "save"
+            elif "load mcp server" in msg_lower:
+                tool_name = "mcp"
+            elif "unload mcp server" in msg_lower:
+                tool_name = "mcp"
+            elif "restart rig" in msg_lower:
+                tool_name = "restart"
+
+            # Create tool call
+            tool_call = ToolCall(
+                tool_call_id=ToolCall.generate_id(),
+                title=f"Executing {tool_name}",
+                kind=rig_tool_to_acp_kind(tool_name),
+                status=ToolCallStatus.PENDING,
+                raw_input={"tool": tool_name, "preview": content_preview},
+            )
+
+            # Report tool call and request permission (run in event loop)
+            async def report_and_request() -> bool:
+                await self._report_tool_call(session_id, tool_call)
+                allowed = await self._request_tool_permission(session_id, tool_call)
+
+                if allowed:
+                    await self._update_tool_call(
+                        session_id,
+                        tool_call.tool_call_id,
+                        ToolCallStatus.IN_PROGRESS,
+                    )
+                else:
+                    await self._update_tool_call(
+                        session_id,
+                        tool_call.tool_call_id,
+                        ToolCallStatus.FAILED,
+                        content=[
+                            {
+                                "type": "content",
+                                "content": {
+                                    "type": "text",
+                                    "text": "Permission denied",
+                                },
+                            }
+                        ],
+                    )
+                return allowed
+
+            # Run async code in event loop
+            # Use configurable timeout for permission requests (default 60s)
+            # Longer timeout allows users time to review complex operations
+            permission_timeout = 60.0
+            future = asyncio.run_coroutine_threadsafe(report_and_request(), loop)
+            try:
+                return future.result(timeout=permission_timeout)
+            except TimeoutError:
+                logger.warning(
+                    f"Tool permission request timed out after {permission_timeout}s, denying for safety"
+                )
+                return False
+            except Exception as e:
+                logger.warning(
+                    "Tool permission check failed: %s, denying for safety", e
+                )
+                return False
+
+        return confirm_callback
+
+    async def _complete_pending_tool_calls(
+        self,
+        session_id: str,
+        success: bool = True,
+    ) -> None:
+        """Mark all in-progress tool calls as completed.
+
+        Args:
+            session_id: The session ID
+            success: Whether execution succeeded
+        """
+        if session_id not in self._tool_calls:
+            return
+
+        for tool_call_id, tool_call in self._tool_calls[session_id].items():
+            # Complete both IN_PROGRESS and PENDING tool calls
+            # PENDING calls may be orphaned if permission request failed to transition
+            if tool_call.status in (ToolCallStatus.IN_PROGRESS, ToolCallStatus.PENDING):
+                status = ToolCallStatus.COMPLETED if success else ToolCallStatus.FAILED
+                await self._update_tool_call(
+                    session_id,
+                    tool_call_id,
+                    status,
+                )
+
+    async def initialize(
+        self,
+        protocol_version: int,
+        client_capabilities: Any | None = None,
+        client_info: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Handle initialize request from client.
+
+        Args:
+            protocol_version: ACP protocol version from client
+            client_capabilities: Client's capabilities
+            client_info: Client implementation info
+
+        Returns:
+            InitializeResponse with negotiated protocol version
+        """
+        if not _import_acp():
+            # Can't construct ACP error response without the package
+            raise RuntimeError(
+                "agent-client-protocol package not installed. "
+                "Install with: pip install 'rig[acp]'"
+            )
+
+        # Initialize rig on first connection
+        if not self._initialized and not self._init_error:
+            try:
+                init(
+                    model=self._model,
+                    interactive=False,
+                    tool_allowlist=None,
+                    tool_format="markdown",
+                )
+            except Exception as e:
+                # Store the error instead of raising — raising would kill the
+                # ACP connection and leave the editor showing "Loading..." with
+                # no explanation. The error is surfaced in prompt() instead.
+                self._init_error = (
+                    f"rig initialization failed: {e}. "
+                    "Ensure API keys are set in environment or config.toml."
+                )
+                logger.error(self._init_error)
+                return _check_acp_import(InitializeResponse, "InitializeResponse")(
+                    protocol_version=protocol_version,
+                    agent_info=_agent_info(),
+                )
+
+            self._initialized = True
+            # Capture the resolved model (from config/env/auto-detect)
+            # so subsequent handlers use the same model
+            resolved = get_default_model()
+            if resolved:
+                self._model = f"{resolved.provider}/{resolved.model}"
+            # Store tools for re-setting in other handler contexts
+            self._tools = get_tools()
+
+        logger.info("ACP Initialize: protocol_version=%s", protocol_version)
+        _InitializeResponse = _check_acp_import(
+            InitializeResponse, "InitializeResponse"
+        )
+        return _InitializeResponse(
+            protocol_version=protocol_version,
+            agent_info=_agent_info(),
+        )
+
+    async def new_session(
+        self,
+        cwd: str,
+        mcp_servers: list[Any],
+        **kwargs: Any,
+    ) -> Any:
+        """Create or resume a rig session for the given workspace.
+
+        When a CWD is provided, derives a deterministic session ID from the
+        workspace path so that reconnecting clients (e.g. editor restart)
+        automatically resume the previous conversation instead of creating
+        a new one.
+
+        Args:
+            cwd: Working directory for the session
+            mcp_servers: MCP servers to connect to
+
+        Returns:
+            NewSessionResponse with session ID
+        """
+        if not _import_acp():
+            raise RuntimeError(
+                "agent-client-protocol package not installed. "
+                "Install with: pip install 'rig[acp]'"
+            )
+
+        # Re-set ContextVars that may be missing in this task's context.
+        # ACP framework may dispatch each RPC method in a separate asyncio task,
+        # so ContextVars set during initialize() aren't visible here.
+        if self._model:
+            set_default_model(self._model)
+        if self._tools is not None:
+            set_tools(self._tools)
+
+        # Resolve per-project model from rig.toml in the session's cwd.
+        # Each Zed window may have its own project with a different MODEL in rig.toml,
+        # so we check the project config and override the global model for this session.
+        session_model = self._model
+        if cwd:
+            project_cfg = get_project_config(Path(cwd))
+            if project_cfg and project_cfg.env.get("MODEL"):
+                session_model = project_cfg.env["MODEL"]
+                logger.info(
+                    f"ACP NewSession: using per-project model {session_model!r} from {cwd}/rig.toml"
+                )
+
+        logs_dir = get_logs_dir()
+        resumed = False
+
+        # --- Session resume: derive a deterministic ID from CWD ---
+        # This ensures the same workspace always maps to the same session,
+        # so editor restarts resume the previous conversation.
+        if cwd:
+            session_id = _cwd_session_id(cwd)
+            logdir = logs_dir / session_id
+            logfile = logdir / "conversation.jsonl"
+
+            # Already loaded in this server process?
+            existing = self._registry.get(session_id)
+            if existing and existing.log is not None:
+                logger.info(
+                    f"ACP NewSession: reusing in-memory session {session_id} for {cwd}"
+                )
+                resumed = True
+                log = existing.log
+            elif logfile.exists():
+                # Resume from disk
+                try:
+                    log = LogManager.load(
+                        logdir=logdir,
+                        create=False,
+                        lock=False,
+                    )
+                    resumed = True
+                    n_msgs = len(log.log)
+                    logger.info(
+                        f"ACP NewSession: resumed session {session_id} from disk "
+                        f"({n_msgs} messages) for {cwd}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"ACP NewSession: failed to load {session_id}: {e}, "
+                        "creating fresh session"
+                    )
+                    resumed = False
+        else:
+            session_id = generate_conversation_id(name=None, logs_dir=logs_dir)
+
+        logdir = logs_dir / session_id
+
+        # Store per-session model for use in prompt() and other handlers
+        self._session_models[session_id] = session_model
+
+        # Apply session model to context for this task
+        if session_model and session_model != self._model:
+            set_default_model(session_model)
+
+        if not resumed:
+            # Get tools and initial prompt for a fresh session
+            tools = get_tools()
+            initial_msgs = get_prompt(
+                tools=tools,
+                tool_format="markdown",
+                prompt="full",
+                interactive=False,
+                model=session_model,
+                workspace=Path(cwd) if cwd else None,
+            )
+
+            log = LogManager.load(
+                logdir=logdir,
+                initial_msgs=initial_msgs,
+                create=True,
+                lock=False,
+            )
+
+        # Persist workspace metadata so list_sessions/list_conversations can
+        # find this session by CWD, and so resumed sessions resolve workspace.
+        if cwd:
+            chat_cfg = ChatConfig(
+                _logdir=logdir,
+                workspace=Path(cwd).resolve(),
+            )
+            try:
+                chat_cfg.save()
+            except Exception as e:
+                logger.debug("Failed to save ChatConfig for %s: %s", session_id, e)
+
+        # Register in the in-memory session registry or update existing
+        existing_session = self._registry.get(session_id)
+        if not existing_session:
+            self._registry.create(session_id, log=log, cwd=str(cwd) if cwd else None)
+        else:
+            # Update log reference if the existing entry has no log (e.g. registry
+            # entry existed with log=None from a prior in-memory registration or
+            # a session resumed from disk when the registry entry lacked a log).
+            if log and existing_session.log is None:
+                existing_session.log = log
+            existing_session.touch()
+
+        logger.info(
+            f"ACP NewSession: session_id={session_id}, cwd={cwd}, resumed={resumed}"
+        )
+
+        # Schedule session-open notifications to run AFTER NewSessionResponse is
+        # returned. Sending session/update notifications synchronously during
+        # new_session() causes Zed to reject them with "Failed to get session"
+        # because Zed only registers the session after it processes the response.
+        # By deferring with asyncio.sleep(0) we let the event loop flush the
+        # response to the socket before sending notifications.
+        if self._conn:
+            self._create_background_task(
+                self._send_session_open_notifications(
+                    session_id, session_model, cwd, resumed=resumed
+                )
+            )
+
+        _NewSessionResponse = _check_acp_import(
+            NewSessionResponse, "NewSessionResponse"
+        )
+
+        # Build modes and models state for the session response.
+        # Note: models field was removed from NewSessionResponse in ACP 0.11.0.
+        modes = self._build_modes_state(session_id)
+        models = self._build_models_state(session_model)
+
+        # Build response dict, conditionally including models for older ACP versions
+        response_kwargs = {
+            "session_id": session_id,
+            "modes": modes,
+        }
+        if models is not None:
+            response_kwargs["models"] = models
+
+        return _NewSessionResponse(**response_kwargs)
+
+    def _build_modes_state(self, session_id: str) -> Any:
+        """Build SessionModeState for the session response.
+
+        rig supports two modes:
+        - default: Interactive mode (tools require confirmation)
+        - auto: Autonomous mode (tools run without confirmation, like --no-confirm)
+        """
+        try:
+            from acp.schema import (
+                SessionMode,
+                SessionModeState,
+            )
+        except ImportError:
+            return None
+
+        current_mode = self._session_modes.get(session_id, "default")
+        return SessionModeState(
+            available_modes=[
+                SessionMode(
+                    id="default",
+                    name="Default",
+                    description="Interactive mode — tools require confirmation before executing",
+                ),
+                SessionMode(
+                    id="auto",
+                    name="Auto",
+                    description="Autonomous mode — tools run without confirmation",
+                ),
+            ],
+            current_mode_id=current_mode,
+        )
+
+    def _build_models_state(self, session_model: str | None) -> Any:
+        """Build SessionModelState from rig's model registry."""
+        try:
+            from acp.schema import (
+                ModelInfo,
+                SessionModelState,
+            )
+        except ImportError:
+            return None
+
+        from ..llm.models import MODELS
+
+        available: list[Any] = []
+        for provider, models_dict in MODELS.items():
+            for model_name, meta in models_dict.items():
+                if meta.get("deprecated", False):
+                    continue
+                model_id = f"{provider}/{model_name}"
+                available.append(
+                    ModelInfo(
+                        model_id=model_id,
+                        name=model_name,
+                        description=f"{provider} — context: {meta['context']:,} tokens",
+                    )
+                )
+
+        current = session_model or (self._model or "default")
+        return SessionModelState(
+            available_models=available,
+            current_model_id=current,
+        )
+
+    async def _send_session_open_notifications(
+        self,
+        session_id: str,
+        session_model: str | None,
+        cwd: str,
+        *,
+        resumed: bool = False,
+    ) -> None:
+        """Send session-open notifications after NewSessionResponse is returned.
+
+        Must run as an asyncio.create_task() so it executes after the current
+        coroutine (new_session) returns. This gives Zed time to process
+        NewSessionResponse and register the session before we send notifications
+        that reference the session_id.
+        """
+        # Yield to the event loop so new_session() can return and the response
+        # can be flushed to the socket before we send notifications.
+        await asyncio.sleep(0)
+
+        if not self._conn:
+            return
+
+        try:
+            from acp import (
+                text_block,
+                update_agent_message,
+            )
+        except ImportError:
+            logger.debug("acp not installed, skipping session-open notifications")
+            await self._send_available_commands(session_id)
+            return
+
+        # Surface model and workspace info immediately in the ACP panel.
+        model_info = session_model or "default"
+        workspace_info = str(cwd) if cwd else "none"
+        status = "Resumed session" if resumed else "New session"
+        info_text = (
+            f"ℹ️ {status}\nUsing model: {model_info}\nUsing workspace: {workspace_info}"
+        )
+        info_chunk = update_agent_message(text_block(info_text))
+        try:
+            await self._conn.session_update(
+                session_id=session_id,
+                update=info_chunk,
+                source="rig",
+            )
+        except Exception as e:
+            logger.debug("Failed to send session info notification: %s", e)
+
+        # Surface initialization errors immediately so the user sees them
+        # without having to send a prompt.
+        if self._init_error:
+            error_chunk = update_agent_message(text_block(f"⚠️ {self._init_error}"))
+            try:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="rig",
+                )
+            except Exception as e:
+                logger.debug("Failed to send init error notification: %s", e)
+            # Keep _init_error set so prompt() can still surface it for retries
+
+        # Advertise slash commands for client-side autocomplete.
+        await self._send_available_commands(session_id)
+
+    async def _send_available_commands(self, session_id: str) -> None:
+        """Send AvailableCommandsUpdate notification to advertise slash commands.
+
+        Called from _send_session_open_notifications() (deferred, after session
+        registration) and as a fallback at the start of the first prompt() call.
+        """
+        if not self._conn or session_id in self._session_commands_advertised:
+            return
+        try:
+            from acp.helpers import (
+                update_available_commands,
+            )
+            from acp.schema import (
+                AvailableCommand,
+            )
+
+            from ..commands import get_commands_with_descriptions
+
+            acp_commands = [
+                AvailableCommand(name=name, description=desc)
+                for name, desc in get_commands_with_descriptions()
+            ]
+            await self._conn.session_update(
+                session_id=session_id,
+                update=update_available_commands(acp_commands),
+                source="rig",
+            )
+            self._session_commands_advertised.add(session_id)
+            logger.info(
+                f"ACP AvailableCommandsUpdate: sent {len(acp_commands)} commands"
+                f" for session {session_id[:16]}"
+            )
+        except Exception as e:
+            # Non-fatal: clients still work without autocomplete
+            logger.warning("Failed to send available commands: %s", e, exc_info=True)
+
+    async def _handle_slash_command(
+        self,
+        msg: Message,
+        log: LogManager,
+        session_id: str,
+        text_block: Any,
+        update_agent_message: Any,
+    ) -> Any:
+        """Execute a slash command and stream the output back to the ACP client.
+
+        Some commands are unsafe in an ACP context (e.g. /exit would kill the server,
+        /restart would restart the process). These are blocked and a helpful message is
+        returned instead.
+
+        Args:
+            msg: The user message containing the slash command
+            log: The session's LogManager
+            session_id: The ACP session ID
+            text_block: ACP text_block factory
+            update_agent_message: ACP update_agent_message factory
+
+        Returns:
+            PromptResponse with appropriate stop_reason
+        """
+        import contextlib
+        import io
+
+        from ..commands import handle_cmd
+
+        cmd_name = msg.content.lstrip("/").split()[0]
+
+        # Block commands that are unsafe in server/ACP context
+        acp_blocked_commands = {"exit", "restart"}
+        if cmd_name in acp_blocked_commands:
+            output = f"The /{cmd_name} command is not available in ACP mode."
+            error_chunk = update_agent_message(text_block(output))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="rig",
+                )
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="end_turn")
+
+        # Capture stdout from commands that use print() (e.g. /help, /tools)
+        captured = io.StringIO()
+        response_msgs: list[Message] = []
+        try:
+            with contextlib.redirect_stdout(captured):
+                for resp in handle_cmd(msg.content, log):
+                    log.append(resp)
+                    response_msgs.append(resp)
+        except Exception as e:
+            logger.exception("Error executing slash command %r: %s", msg.content, e)
+            error_text = f"Error executing command: {e}"
+            error_chunk = update_agent_message(text_block(error_text))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="rig",
+                )
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
+
+        # Combine captured stdout with any yielded system messages
+        output_parts: list[str] = []
+        stdout_output = captured.getvalue()
+        if stdout_output:
+            # Wrap multi-line stdout in a code block to preserve formatting
+            # (e.g. /help, /tools output rendered as Markdown in ACP panels)
+            text = stdout_output.rstrip()
+            if "\n" in text:
+                text = md_codeblock("", text)
+            output_parts.append(text)
+        output_parts.extend(
+            resp_msg.content for resp_msg in response_msgs if resp_msg.content
+        )
+
+        output = "\n".join(output_parts) if output_parts else f"/{cmd_name}: done"
+
+        chunk = update_agent_message(text_block(output))
+        if self._conn:
+            await self._conn.session_update(
+                session_id=session_id,
+                update=chunk,
+                source="rig",
+            )
+
+        _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+        return _PromptResponse(stop_reason="end_turn")
+
+    async def prompt(
+        self,
+        prompt: list[Any],
+        session_id: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Handle a prompt from the client.
+
+        This is the main interaction method. It:
+        1. Converts ACP prompt to rig messages
+        2. Runs through rig's chat loop
+        3. Streams responses back via session/update
+
+        Args:
+            prompt: List of ACP content blocks
+            session_id: Session ID from new_session
+
+        Returns:
+            PromptResponse with stop reason
+        """
+        if not _import_acp():
+            raise RuntimeError(
+                "agent-client-protocol package not installed. "
+                "Install with: pip install 'rig[acp]'"
+            )
+
+        from acp import (
+            text_block,
+            update_agent_message,
+        )
+
+        # Surface initialization errors as visible agent messages
+        if self._init_error:
+            error_chunk = update_agent_message(text_block(f"⚠️ {self._init_error}"))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="rig",
+                )
+            # Clear the error so the user can retry after fixing their config
+            self._init_error = None
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
+
+        # Re-set ContextVars that may be missing in this task's context.
+        # ACP framework may dispatch each RPC method in a separate asyncio task,
+        # so ContextVars set during initialize() aren't visible here.
+        # Use per-session model if available (set from per-project rig.toml in new_session).
+        effective_model = self._session_models.get(session_id, self._model)
+        if effective_model:
+            set_default_model(effective_model)
+        elif self._model:
+            set_default_model(self._model)
+        if self._tools is not None:
+            set_tools(self._tools)
+
+        # Resend AvailableCommandsUpdate if not yet sent for this session.
+        # Handles the case where the deferred task from new_session() hasn't run yet
+        # (e.g., early first prompt arriving before asyncio.sleep(0) yields).
+        await self._send_available_commands(session_id)
+
+        session = self._registry.get(session_id)
+        if not session:
+            logger.error("Unknown session: %s", session_id)
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
+        # Update last_activity timestamp for cleanup tracking
+        session.touch()
+        log = session.log
+        if log is None:
+            raise RuntimeError("ACP sessions must have a log")
+
+        # Convert ACP prompt to rig message
+        msg = acp_content_to_rig_message(prompt, "user")
+        log.append(msg)
+
+        content_preview = msg.content[:100] if msg.content else ""
+        logger.info(
+            f"ACP Prompt: session={session_id[:16]}, content={content_preview}..."
+        )
+
+        # Handle slash commands before passing to the LLM.
+        # Commands like /help, /model, /tools are handled locally and their output
+        # is streamed back to the ACP client as a system message.
+        from ..util.content import is_message_command  # fmt: skip
+
+        if is_message_command(msg.content):
+            return await self._handle_slash_command(
+                msg, log, session_id, text_block, update_agent_message
+            )
+
+        # Keep buffering state outside the try-block so it's always in scope in
+        # the exception handler (including early import/setup failures).
+        batch_buffer: list[str] = []
+        try:
+            # Import chat step
+            from ..chat import step as chat_step
+
+            # Run rig chat step in executor to not block event loop
+            loop = asyncio.get_running_loop()
+
+            # Build a batching on_token callback that sends incremental session_update
+            # calls during generation, enabling per-token streaming to the client.
+            FLUSH_INTERVAL = 0.1  # seconds
+            FLUSH_SIZE = 50  # characters (measured across buffer items)
+
+            last_flush: list[float] = [
+                time.monotonic()
+            ]  # mutable for nonlocal in nested fn; tracks last *successful* flush
+            last_attempt: list[float] = [
+                time.monotonic()
+            ]  # tracks last flush *attempt*; prevents retry cascade under event loop pressure
+
+            def _flush_batch() -> None:
+                """Flush accumulated tokens as a session_update (called from executor thread)."""
+                if not batch_buffer or not self._conn:
+                    return
+                batch_text = "".join(batch_buffer)
+                chunk = update_agent_message(text_block(batch_text))
+                future = asyncio.run_coroutine_threadsafe(
+                    self._conn.session_update(
+                        session_id=session_id,
+                        update=chunk,
+                        source="rig-stream",
+                    ),
+                    loop,
+                )
+                try:
+                    # Timeout matches flush interval to bound worst-case stall per attempt
+                    future.result(timeout=FLUSH_INTERVAL)
+                    batch_buffer.clear()  # Only clear after confirmed successful send
+                    last_flush[0] = time.monotonic()  # Only advance timer on success
+                    last_attempt[0] = last_flush[
+                        0
+                    ]  # Sync attempt to flush time on success
+                except Exception:
+                    # Check if the coroutine completed just after the timeout deadline.
+                    # future.cancel() is a no-op on an already-completed task, so if the
+                    # send succeeded we clear the buffer to avoid duplicate delivery on retry.
+                    already_sent = (
+                        future.done()
+                        and not future.cancelled()
+                        and future.exception() is None
+                    )
+                    future.cancel()
+                    last_attempt[0] = (
+                        time.monotonic()
+                    )  # Throttle retry: enforce FLUSH_INTERVAL between attempts
+                    if already_sent:
+                        # Coroutine completed despite our timeout — safe to clear, no retry needed
+                        batch_buffer.clear()
+                        last_flush[0] = last_attempt[0]
+                    else:
+                        # Tokens weren't delivered — preserve buffer so final flush can retry
+                        # last_flush[0] is NOT updated, so time-based retry fires when event loop recovers
+                        logger.debug(
+                            "Failed to send streaming token batch", exc_info=True
+                        )
+
+            def on_token(token: str) -> None:
+                """Accumulate a token; flush if size/time threshold is reached."""
+                batch_buffer.append(token)
+                now = time.monotonic()
+                # last_flush[0] is intentionally not updated on failure, so the
+                # time-based trigger stays open after a failed flush.
+                # last_attempt[0] alone throttles retry cadence to FLUSH_INTERVAL.
+                if (
+                    sum(len(t) for t in batch_buffer) >= FLUSH_SIZE
+                    or (now - last_flush[0]) >= FLUSH_INTERVAL
+                ) and (now - last_attempt[0]) >= FLUSH_INTERVAL:
+                    _flush_batch()
+
+            def run_chat_step() -> list[Message]:
+                """Run chat step synchronously with per-token streaming."""
+                # Note: confirmation is now handled via the hook system
+                return list(
+                    chat_step(
+                        log=log.log,
+                        stream=True,
+                        tool_format="markdown",
+                        model=effective_model,
+                        on_token=on_token,
+                    )
+                )
+
+            # Copy context to propagate ContextVars (model, config, tools, etc.)
+            # to the executor thread — run_in_executor doesn't do this by default
+            ctx = contextvars.copy_context()
+            response_msgs = await loop.run_in_executor(None, ctx.run, run_chat_step)
+
+            # Final flush: send any remaining buffered tokens
+            if batch_buffer and self._conn:
+                batch_text = "".join(batch_buffer)
+                final_chunk = update_agent_message(text_block(batch_text))
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=final_chunk,
+                    source="rig-stream",
+                )
+                batch_buffer.clear()  # Only clear after confirmed successful send
+
+            # Phase 2: Mark all in-progress tool calls as completed
+            await self._complete_pending_tool_calls(session_id)
+
+            # Process response messages: add to log and forward non-assistant messages.
+            # Assistant messages were already streamed incrementally via on_token,
+            # so we skip re-sending their content to avoid duplicating the output.
+            # NOTE: Before this PR, tool-result messages were silently dropped (neither sent
+            # nor logged). Now they are forwarded via session_update so clients see tool output.
+            # This is intentional: clients receive one assistant-text stream + any tool results.
+            for response_msg in response_msgs:
+                if response_msg.role == "assistant":
+                    # Tokens were already sent via on_token batching; just persist to log.
+                    log.append(response_msg)
+                else:
+                    # Tool results and other non-assistant messages: send via session_update.
+                    content = rig_message_to_acp_content(response_msg)
+                    for block in content:
+                        text = block.get("text", "")
+                        if text and self._conn:
+                            chunk = update_agent_message(text_block(text))
+                            await self._conn.session_update(
+                                session_id=session_id,
+                                update=chunk,
+                                source="rig",
+                            )
+                    log.append(response_msg)
+
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="end_turn")
+
+        except Exception as e:
+            logger.exception("Error processing prompt: %s", e)
+            # Best-effort flush of any buffered tokens before error message,
+            # so the client sees partial output before the error notification.
+            if batch_buffer and self._conn:
+                try:
+                    batch_text = "".join(batch_buffer)
+                    await self._conn.session_update(
+                        session_id=session_id,
+                        update=update_agent_message(text_block(batch_text)),
+                        source="rig-stream",
+                    )
+                    batch_buffer.clear()  # Only clear after confirmed successful send
+                except Exception:
+                    logger.debug("Failed to flush token buffer on error", exc_info=True)
+            # Phase 2: Mark tool calls as failed on error
+            await self._complete_pending_tool_calls(session_id, success=False)
+            # Send error message
+            error_chunk = update_agent_message(text_block(f"Error: {e}"))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="rig",
+                )
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
+
+    async def load_session(
+        self,
+        session_id: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Load an existing session from persistent log storage.
+
+        Looks up the session by conversation ID in the rig logs directory.
+        If found, restores the LogManager and registers the session.
+        Returns None if the session doesn't exist on disk, letting the client
+        gracefully fall back to creating a new session via new_session().
+
+        Args:
+            session_id: Conversation ID (e.g. "2025-08-30-jumping-orange-walrus")
+
+        Returns:
+            NewSessionResponse if session found, None otherwise
+        """
+        if not _import_acp():
+            return None
+
+        # Check if already loaded in-memory
+        if self._registry.get(session_id):
+            logger.info("load_session: %s already in registry", session_id[:16])
+            return self._build_load_session_response(session_id)
+
+        # Try to load from persistent storage
+        logs_dir = get_logs_dir()
+        logdir = logs_dir / session_id
+        logfile = logdir / "conversation.jsonl"
+
+        if not logfile.exists():
+            logger.info("load_session: %s not found on disk", session_id[:16])
+            return None
+
+        try:
+            log = LogManager.load(
+                logdir=logdir,
+                create=False,
+                lock=False,
+            )
+            self._registry.create(session_id, log=log)
+            logger.info(
+                f"load_session: restored {session_id[:16]} ({len(log.log)} messages)"
+            )
+
+            return self._build_load_session_response(session_id)
+        except Exception as e:
+            logger.warning("load_session: failed to load %s: %s", session_id[:16], e)
+            return None
+
+    def _build_load_session_response(self, session_id: str) -> Any:
+        """Build a NewSessionResponse for a loaded session with modes and models.
+
+        Ensures loaded sessions get the same modes/models state as new sessions,
+        and schedules deferred notifications (available commands, model info).
+        """
+        _NewSessionResponse = _check_acp_import(
+            NewSessionResponse, "NewSessionResponse"
+        )
+
+        # Initialize per-session model if not already set
+        session_model = self._session_models.setdefault(session_id, self._model)
+
+        # Build modes and models state (same as new_session)
+        # Note: models field was removed from NewSessionResponse in ACP 0.11.0.
+        modes = self._build_modes_state(session_id)
+        models = self._build_models_state(session_model)
+
+        # Schedule deferred notifications (commands, model info)
+        session = self._registry.get(session_id)
+        cwd = (session.cwd or "") if session else ""
+        if self._conn:
+            self._create_background_task(
+                self._send_session_open_notifications(
+                    session_id, session_model, cwd, resumed=True
+                )
+            )
+
+        # Build response dict, conditionally including models for older ACP versions
+        response_kwargs = {
+            "session_id": session_id,
+            "modes": modes,
+        }
+        if models is not None:
+            response_kwargs["models"] = models
+
+        return _NewSessionResponse(**response_kwargs)
+
+    def _cleanup_session(self, session_id: str) -> None:
+        """Remove all per-session state for a given session.
+
+        Cleans up _session_models, _session_modes, _tool_calls, and
+        _permission_policies to prevent unbounded memory growth from
+        accumulated sessions.
+        """
+        self._session_models.pop(session_id, None)
+        self._session_modes.pop(session_id, None)
+        self._tool_calls.pop(session_id, None)
+        self._permission_policies.pop(session_id, None)
+        self._session_commands_advertised.discard(session_id)
+        self._registry.remove(session_id)
+
+    async def cancel(
+        self,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Cancel an ongoing operation and clean up session state.
+
+        Args:
+            session_id: Session to cancel
+        """
+        logger.info("Cancelling session %s", session_id)
+        self._cleanup_session(session_id)
+
+    async def list_sessions(
+        self,
+        cursor: str | None = None,
+        cwd: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """List available sessions from persistent storage.
+
+        Returns sessions from disk (rig logs directory), merged with any
+        active in-memory sessions. Sessions are sorted by modification time
+        (most recent first).
+        """
+        if not _import_acp():
+            raise RuntimeError("agent-client-protocol package not installed")
+        from acp.client.connection import (
+            ListSessionsResponse,
+        )
+        from acp.schema import SessionInfo
+
+        # Get persistent conversations from disk
+        conversations = list_conversations(limit=50)
+
+        # Build session list, merging disk metadata with in-memory state
+        active_ids = set(self._registry.list_sessions())
+        sessions: list[Any] = []
+
+        for conv in conversations:
+            # Prefer in-memory cwd (set at session creation) over disk workspace
+            in_memory = self._registry.get(conv.id)
+            session_cwd = (
+                (in_memory.cwd or "")
+                if in_memory and in_memory.cwd
+                else (conv.workspace if conv.workspace != "." else "")
+            )
+
+            # Apply cwd filter if specified
+            if cwd and session_cwd != cwd:
+                active_ids.discard(conv.id)
+                continue
+
+            sessions.append(
+                SessionInfo(
+                    session_id=conv.id,
+                    cwd=session_cwd,
+                    title=conv.name if conv.name != conv.id else None,
+                    updated_at=datetime.fromtimestamp(
+                        conv.modified, tz=timezone.utc
+                    ).isoformat(),
+                )
+            )
+            active_ids.discard(conv.id)
+
+        # Add any in-memory sessions not yet on disk
+        for sid in active_ids:
+            in_memory = self._registry.get(sid)
+            session_cwd = (in_memory.cwd or "") if in_memory else ""
+            if cwd and session_cwd != cwd:
+                continue
+            sessions.append(
+                SessionInfo(
+                    session_id=sid,
+                    cwd=session_cwd,
+                    updated_at=(
+                        in_memory.last_activity.isoformat() if in_memory else None
+                    ),
+                )
+            )
+
+        return ListSessionsResponse(sessions=sessions)
+
+    async def authenticate(
+        self,
+        method_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Handle authentication request (not supported)."""
+        logger.warning("authenticate not implemented: %s", method_id)
+        return
+
+    async def set_session_model(
+        self,
+        model_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Set the model for a specific session."""
+        logger.info("set_session_model: session=%s, model=%s", session_id, model_id)
+        self._session_models[session_id] = model_id
+        return
+
+    async def set_session_mode(
+        self,
+        mode_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Set the mode for a session.
+
+        Supported modes:
+        - default: Interactive mode (tools require confirmation)
+        - auto: Autonomous mode (tools run without confirmation)
+        """
+        valid_modes = {"default", "auto"}
+        if mode_id not in valid_modes:
+            logger.warning(
+                f"set_session_mode: unknown mode {mode_id!r}, ignoring. "
+                f"Valid modes: {valid_modes}"
+            )
+            return
+        logger.info("set_session_mode: session=%s, mode=%s", session_id, mode_id)
+        self._session_modes[session_id] = mode_id
+
+    async def ext_method(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle extension method calls."""
+        logger.warning("ext_method not implemented: %s", method)
+        return {}
+
+    async def ext_notification(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        """Handle extension notifications."""
+        logger.debug("ext_notification: %s", method)
+
+
+def create_agent() -> RigAgent:
+    """Create a new RigAgent instance.
+
+    Returns:
+        Configured RigAgent
+    """
+    return RigAgent()

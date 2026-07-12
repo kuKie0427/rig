@@ -1,0 +1,31 @@
+name: rig-bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  run-bot:
+    # Only run when the comment explicitly @-mentions the bot.
+    # Without this, CI spins up on every comment (even bot reviews, CI notifications, etc.)
+    # which wastes runner minutes for an immediate allowlist-fail exit.
+    if: contains(github.event.comment.body, '@rig')
+    runs-on: ubuntu-latest
+    steps:
+      # needed to run the action in the same repo
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Run rig-bot action
+        uses: ./.github/actions/bot
+        with:
+          model: 'anthropic/claude-sonnet-4-6'
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowlist: "ErikBjare"

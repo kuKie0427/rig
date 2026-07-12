@@ -1,0 +1,672 @@
+"""Tests for lesson index module."""
+
+import json
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from rig.lessons.index import LessonIndex, clear_cache, get_cache_stats
+
+
+@pytest.fixture
+def temp_lesson_dir():
+    """Create a temporary directory with test lessons."""
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson_dir = Path(tmp) / "lessons"
+        lesson_dir.mkdir()
+        yield lesson_dir
+
+
+@pytest.fixture
+def sample_lesson_content():
+    """Sample lesson content."""
+    return """---
+match:
+  keywords: ["test", "sample"]
+status: active
+---
+
+# Test Lesson
+
+This is a test lesson for unit testing.
+
+## Context
+Testing the lesson index.
+"""
+
+
+class TestLessonIndex:
+    """Tests for LessonIndex class."""
+
+    def test_index_empty_directory(self, temp_lesson_dir):
+        """Test indexing an empty directory."""
+        clear_cache()
+        index = LessonIndex([temp_lesson_dir])
+        assert len(index.lessons) == 0
+
+    def test_index_single_lesson(self, temp_lesson_dir, sample_lesson_content):
+        """Test indexing a single lesson."""
+        clear_cache()
+        lesson_file = temp_lesson_dir / "test-lesson.md"
+        lesson_file.write_text(sample_lesson_content)
+
+        index = LessonIndex([temp_lesson_dir])
+        assert len(index.lessons) == 1
+        assert index.lessons[0].title == "Test Lesson"
+
+    def test_index_multiple_lessons(self, temp_lesson_dir, sample_lesson_content):
+        """Test indexing multiple lessons."""
+        clear_cache()
+        for i in range(3):
+            lesson_file = temp_lesson_dir / f"lesson-{i}.md"
+            content = sample_lesson_content.replace("Test Lesson", f"Lesson {i}")
+            lesson_file.write_text(content)
+
+        index = LessonIndex([temp_lesson_dir])
+        assert len(index.lessons) == 3
+
+    def test_index_skips_readme(self, temp_lesson_dir, sample_lesson_content):
+        """Test that README.md is skipped."""
+        clear_cache()
+        # Create a regular lesson
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+        # Create a README that should be skipped
+        (temp_lesson_dir / "README.md").write_text("# Readme\n\nNot a lesson.")
+
+        index = LessonIndex([temp_lesson_dir])
+        assert len(index.lessons) == 1
+        assert index.lessons[0].title == "Test Lesson"
+
+    def test_index_skips_templates(self, temp_lesson_dir, sample_lesson_content):
+        """Test that template files are skipped."""
+        clear_cache()
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+        (temp_lesson_dir / "template.md").write_text(sample_lesson_content)
+        (temp_lesson_dir / "lesson-template.md").write_text(sample_lesson_content)
+
+        index = LessonIndex([temp_lesson_dir])
+        assert len(index.lessons) == 1
+
+    def test_manifest_index_builds_skill_stub_then_materializes(self, tmp_path: Path):
+        """index.json should avoid eager SKILL.md parsing but still support full reads."""
+        clear_cache()
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "deploy-helper"
+        skill_dir.mkdir(parents=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(
+            """---
+name: deploy-helper
+description: Automates deployment workflows
+keywords:
+  - deployment workflow
+---
+
+# Production Deployment Tool
+
+Content about deployments.
+"""
+        )
+        (skills_dir / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": "1.0",
+                    "skills": [
+                        {
+                            "name": "deploy-helper",
+                            "description": "Automates deployment workflows",
+                            "path": "deploy-helper",
+                            "keywords": ["deployment workflow"],
+                        }
+                    ],
+                }
+            )
+        )
+
+        index = LessonIndex([skills_dir])
+        assert len(index.lessons) == 1
+
+        skill = index.lessons[0]
+        assert skill.is_stub is True
+        assert skill.metadata.name == "deploy-helper"
+        assert skill.body == ""
+
+        materialized = index.materialize_lesson(skill)
+        assert materialized.is_stub is False
+        assert materialized.title == "Production Deployment Tool"
+        assert "Content about deployments." in materialized.body
+
+
+class TestLessonDeduplication:
+    """Tests for lesson deduplication feature.
+
+    Deduplication is two-level:
+    1. By resolved path (realpath) — catches symlinks to the same file
+    2. By relative filename — catches same-named lessons across directories
+       (first directory wins)
+    """
+
+    def test_same_filename_different_dirs_deduplicated(self, sample_lesson_content):
+        """Test that same-named files in different directories are deduplicated.
+
+        When the same relative filename exists in multiple configured lesson
+        directories, only the version from the first directory is included.
+        This prevents double-injection of lessons that exist in both
+        workspace lessons/ and rig-contrib/lessons/.
+        """
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            dir1.mkdir()
+            dir2.mkdir()
+
+            # Same filename in both directories, but different physical files
+            content1 = sample_lesson_content.replace("Test Lesson", "First Version")
+            content2 = sample_lesson_content.replace("Test Lesson", "Second Version")
+
+            (dir1 / "duplicate.md").write_text(content1)
+            (dir2 / "duplicate.md").write_text(content2)
+
+            index = LessonIndex([dir1, dir2])
+
+            # Filename dedup: first directory wins
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "First Version"
+
+    def test_symlink_deduplication(self, sample_lesson_content):
+        """Test that symlinks to the same file are deduplicated.
+
+        This is the main use case: when lessons/x.md is a symlink to
+        rig-contrib/lessons/x.md, and both directories are configured,
+        the lesson should only be included once.
+        """
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            real_dir = Path(tmp1) / "real-lessons"
+            symlink_dir = Path(tmp2) / "symlinked-lessons"
+            real_dir.mkdir()
+            symlink_dir.mkdir()
+
+            # Create the real file
+            content = sample_lesson_content.replace("Test Lesson", "Real Lesson")
+            real_file = real_dir / "shared-lesson.md"
+            real_file.write_text(content)
+
+            # Create a symlink pointing to the real file
+            symlink_file = symlink_dir / "shared-lesson.md"
+            symlink_file.symlink_to(real_file)
+
+            # Index both directories (symlink dir first)
+            index = LessonIndex([symlink_dir, real_dir])
+
+            # Should only have one lesson (realpath deduplication)
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "Real Lesson"
+
+    def test_deduplication_different_filenames(self, sample_lesson_content):
+        """Test that lessons with different filenames are not deduplicated."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            dir1.mkdir()
+            dir2.mkdir()
+
+            content1 = sample_lesson_content.replace("Test Lesson", "Lesson A")
+            content2 = sample_lesson_content.replace("Test Lesson", "Lesson B")
+
+            (dir1 / "lesson-a.md").write_text(content1)
+            (dir2 / "lesson-b.md").write_text(content2)
+
+            index = LessonIndex([dir1, dir2])
+
+            # Should have both lessons
+            assert len(index.lessons) == 2
+            titles = {lesson.title for lesson in index.lessons}
+            assert "Lesson A" in titles
+            assert "Lesson B" in titles
+
+    def test_symlink_in_subdirectory(self, sample_lesson_content):
+        """Test symlink deduplication works in subdirectories."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            real_dir = Path(tmp1) / "lessons"
+            symlink_dir = Path(tmp2) / "lessons"
+            real_dir.mkdir()
+            symlink_dir.mkdir()
+
+            # Create real file in subdirectory
+            (real_dir / "workflow").mkdir()
+            content = sample_lesson_content.replace("Test Lesson", "Workflow Lesson")
+            real_file = real_dir / "workflow" / "git-workflow.md"
+            real_file.write_text(content)
+
+            # Create symlink in different subdirectory
+            (symlink_dir / "tools").mkdir()
+            symlink_file = symlink_dir / "tools" / "git-workflow.md"
+            symlink_file.symlink_to(real_file)
+
+            index = LessonIndex([symlink_dir, real_dir])
+
+            # Should only have one lesson (symlink resolves to same file)
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "Workflow Lesson"
+
+    def test_different_files_same_name_in_subdirectories(self, sample_lesson_content):
+        """Test different files with same name in subdirectories are NOT deduplicated."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            dir1.mkdir()
+            dir2.mkdir()
+
+            # Create different files with same name in different subdirectories
+            (dir1 / "workflow").mkdir()
+            (dir2 / "tools").mkdir()
+
+            content1 = sample_lesson_content.replace("Test Lesson", "Workflow Version")
+            content2 = sample_lesson_content.replace("Test Lesson", "Tools Version")
+
+            (dir1 / "workflow" / "git-workflow.md").write_text(content1)
+            (dir2 / "tools" / "git-workflow.md").write_text(content2)
+
+            index = LessonIndex([dir1, dir2])
+
+            # Both files have different realpaths, so both are included
+            assert len(index.lessons) == 2
+            titles = {lesson.title for lesson in index.lessons}
+            assert "Workflow Version" in titles
+            assert "Tools Version" in titles
+
+    def test_symlinks_multiple_directories(self, sample_lesson_content):
+        """Test symlink deduplication with more than 2 directories."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+            tempfile.TemporaryDirectory() as tmp3,
+        ):
+            # tmp1 has the real file
+            real_dir = Path(tmp1) / "lessons"
+            real_dir.mkdir()
+            content = sample_lesson_content.replace("Test Lesson", "Real Lesson")
+            real_file = real_dir / "shared.md"
+            real_file.write_text(content)
+
+            # tmp2 and tmp3 have symlinks to the real file
+            symlink_dirs = []
+            for tmp in [tmp2, tmp3]:
+                symlink_dir = Path(tmp) / "lessons"
+                symlink_dir.mkdir()
+                symlink_dirs.append(symlink_dir)
+                symlink_file = symlink_dir / "shared.md"
+                symlink_file.symlink_to(real_file)
+
+            # Index all directories
+            index = LessonIndex(symlink_dirs + [real_dir])
+
+            # Should only have one lesson (all resolve to same realpath)
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "Real Lesson"
+
+    def test_same_filename_multiple_directories_first_wins(self, sample_lesson_content):
+        """Test that same-named files in 3+ directories are deduplicated (first wins)."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+            tempfile.TemporaryDirectory() as tmp3,
+        ):
+            dirs = []
+            for i, tmp in enumerate([tmp1, tmp2, tmp3]):
+                lesson_dir = Path(tmp) / "lessons"
+                lesson_dir.mkdir()
+                dirs.append(lesson_dir)
+
+                content = sample_lesson_content.replace(
+                    "Test Lesson", f"Version {i + 1}"
+                )
+                (lesson_dir / "shared.md").write_text(content)
+
+            index = LessonIndex(dirs)
+
+            # Filename dedup: first directory wins
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "Version 1"
+
+    def test_same_relative_path_in_subdirs_deduplicated(self, sample_lesson_content):
+        """Test that same relative path (subdir/file.md) across dirs is deduplicated.
+
+        This is the real-world case: lessons/social/foo.md in workspace and
+        rig-contrib/lessons/social/foo.md — same relative path, first dir wins.
+        """
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            (dir1 / "social").mkdir(parents=True)
+            (dir2 / "social").mkdir(parents=True)
+
+            content1 = sample_lesson_content.replace("Test Lesson", "Workspace Version")
+            content2 = sample_lesson_content.replace("Test Lesson", "Contrib Version")
+
+            (dir1 / "social" / "github-engagement.md").write_text(content1)
+            (dir2 / "social" / "github-engagement.md").write_text(content2)
+
+            index = LessonIndex([dir1, dir2])
+
+            # Same relative path social/github-engagement.md → first dir wins
+            assert len(index.lessons) == 1
+            assert index.lessons[0].title == "Workspace Version"
+
+    def test_different_relative_paths_not_deduplicated(self, sample_lesson_content):
+        """Test that different relative paths are NOT deduplicated even with same basename."""
+        clear_cache()
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            (dir1 / "workflow").mkdir(parents=True)
+            (dir2 / "social").mkdir(parents=True)
+
+            content1 = sample_lesson_content.replace("Test Lesson", "Workflow Version")
+            content2 = sample_lesson_content.replace("Test Lesson", "Social Version")
+
+            # Same filename but different subdirectories = different relative paths
+            (dir1 / "workflow" / "best-practices.md").write_text(content1)
+            (dir2 / "social" / "best-practices.md").write_text(content2)
+
+            index = LessonIndex([dir1, dir2])
+
+            # Different relative paths → both included
+            assert len(index.lessons) == 2
+            titles = {lesson.title for lesson in index.lessons}
+            assert "Workflow Version" in titles
+            assert "Social Version" in titles
+
+    def test_inactive_lesson_in_first_dir_blocks_active_in_second(
+        self, sample_lesson_content
+    ):
+        """Test that an inactive lesson in an earlier dir suppresses same file in later dirs.
+
+        'First directory wins' must hold regardless of lesson status.
+        A user who marks a lesson as 'deprecated' in their workspace dir should
+        fully suppress it, even if an active copy exists in rig-contrib/lessons/.
+        """
+        clear_cache()
+        draft_content = sample_lesson_content.replace(
+            "status: active", "status: deprecated"
+        ).replace("Test Lesson", "Draft Version")
+        active_content = sample_lesson_content.replace("Test Lesson", "Active Version")
+
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons"
+            dir2 = Path(tmp2) / "lessons"
+            dir1.mkdir()
+            dir2.mkdir()
+
+            # dir1 has an inactive copy (should claim the slot)
+            (dir1 / "shared.md").write_text(draft_content)
+            # dir2 has an active copy (should be suppressed by dir1's copy)
+            (dir2 / "shared.md").write_text(active_content)
+
+            index = LessonIndex([dir1, dir2])
+
+            # The active copy from dir2 must NOT be loaded (dir1 wins)
+            assert len(index.lessons) == 0
+
+
+class TestLessonCache:
+    """Tests for lesson caching functionality."""
+
+    def test_cache_hit(self, temp_lesson_dir, sample_lesson_content):
+        """Test that cached lessons are reused."""
+        clear_cache()
+        lesson_file = temp_lesson_dir / "cached.md"
+        lesson_file.write_text(sample_lesson_content)
+
+        # First index - should cache
+        LessonIndex([temp_lesson_dir])
+        initial_stats = get_cache_stats()
+        assert initial_stats["cached_lessons"] >= 1
+
+        # Second index - should hit cache
+        LessonIndex([temp_lesson_dir])
+        final_stats = get_cache_stats()
+        assert final_stats["cached_lessons"] >= 1
+
+    def test_cache_invalidation_on_change(self, temp_lesson_dir, sample_lesson_content):
+        """Test that cache is invalidated when file changes."""
+        clear_cache()
+        lesson_file = temp_lesson_dir / "changing.md"
+        lesson_file.write_text(sample_lesson_content)
+
+        # First index
+        index1 = LessonIndex([temp_lesson_dir])
+        assert index1.lessons[0].title == "Test Lesson"
+
+        # Modify file
+        new_content = sample_lesson_content.replace("Test Lesson", "Modified Lesson")
+        import time
+
+        time.sleep(0.01)  # Ensure mtime changes
+        lesson_file.write_text(new_content)
+
+        # Second index should pick up changes
+        index2 = LessonIndex([temp_lesson_dir])
+        assert index2.lessons[0].title == "Modified Lesson"
+
+    def test_clear_cache(self, temp_lesson_dir, sample_lesson_content):
+        """Test cache clearing."""
+        clear_cache()
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+
+        LessonIndex([temp_lesson_dir])
+        stats1 = get_cache_stats()
+        assert stats1["cached_lessons"] >= 1
+
+        clear_cache()
+        stats2 = get_cache_stats()
+        assert stats2["cached_lessons"] == 0
+
+
+class TestLessonSearch:
+    """Tests for lesson search functionality."""
+
+    def test_search_by_title(self, temp_lesson_dir, sample_lesson_content):
+        """Test searching lessons by title."""
+        clear_cache()
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+
+        index = LessonIndex([temp_lesson_dir])
+        results = index.search("Test")
+
+        assert len(results) == 1
+        assert results[0].title == "Test Lesson"
+
+    def test_search_no_results(self, temp_lesson_dir, sample_lesson_content):
+        """Test search with no matching results."""
+        clear_cache()
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+
+        index = LessonIndex([temp_lesson_dir])
+        results = index.search("nonexistent")
+
+        assert len(results) == 0
+
+    def test_search_case_insensitive(self, temp_lesson_dir, sample_lesson_content):
+        """Test that search is case-insensitive."""
+        clear_cache()
+        (temp_lesson_dir / "test.md").write_text(sample_lesson_content)
+
+        index = LessonIndex([temp_lesson_dir])
+        results = index.search("test lesson")
+
+        assert len(results) == 1
+
+
+class TestExtraLessonDirsEnv:
+    """Tests for RIG_LESSONS_EXTRA_DIRS environment variable."""
+
+    def test_extra_dirs_adds_lessons(self, sample_lesson_content, monkeypatch):
+        """Test that RIG_LESSONS_EXTRA_DIRS adds extra lesson directories."""
+        clear_cache()
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_extra:
+            extra_dir = Path(tmp_extra) / "extra-lessons"
+            extra_dir.mkdir()
+            content = sample_lesson_content.replace("Test Lesson", "Extra Lesson")
+            (extra_dir / "extra.md").write_text(content)
+
+            monkeypatch.setenv("RIG_LESSONS_EXTRA_DIRS", str(extra_dir))
+
+            # _default_dirs should include the extra dir
+            default_dirs = LessonIndex._default_dirs()
+            assert any(d.resolve() == extra_dir.resolve() for d in default_dirs), (
+                f"Extra dir not found in default dirs: {default_dirs}"
+            )
+
+    def test_extra_dirs_multiple_colon_separated(
+        self, sample_lesson_content, monkeypatch
+    ):
+        """Test that multiple dirs can be specified with colon separator."""
+        clear_cache()
+        import tempfile
+
+        with (
+            tempfile.TemporaryDirectory() as tmp1,
+            tempfile.TemporaryDirectory() as tmp2,
+        ):
+            dir1 = Path(tmp1) / "lessons1"
+            dir2 = Path(tmp2) / "lessons2"
+            dir1.mkdir()
+            dir2.mkdir()
+
+            (dir1 / "a.md").write_text(
+                sample_lesson_content.replace("Test Lesson", "Lesson A")
+            )
+            (dir2 / "b.md").write_text(
+                sample_lesson_content.replace("Test Lesson", "Lesson B")
+            )
+
+            monkeypatch.setenv("RIG_LESSONS_EXTRA_DIRS", f"{dir1}:{dir2}")
+
+            default_dirs = LessonIndex._default_dirs()
+            resolved = [d.resolve() for d in default_dirs]
+            assert dir1.resolve() in resolved
+            assert dir2.resolve() in resolved
+
+    def test_extra_dirs_nonexistent_logs_warning(self, monkeypatch, caplog):
+        """Test that a nonexistent extra dir logs a warning but does not raise."""
+        import logging
+
+        clear_cache()
+        monkeypatch.setenv("RIG_LESSONS_EXTRA_DIRS", "/nonexistent/path/lessons")
+
+        with caplog.at_level(logging.WARNING):
+            default_dirs = LessonIndex._default_dirs()
+        assert any("directory not found" in m for m in caplog.messages)
+        assert not any(str(d) == "/nonexistent/path/lessons" for d in default_dirs)
+
+    def test_extra_dirs_empty_string(self, monkeypatch):
+        """Test that empty string is handled gracefully."""
+        clear_cache()
+        monkeypatch.setenv("RIG_LESSONS_EXTRA_DIRS", "")
+
+        # Should not raise or add any extra dirs
+        default_dirs = LessonIndex._default_dirs()
+        assert isinstance(default_dirs, list)
+
+    def test_extra_dirs_not_set(self, monkeypatch):
+        """Test that unset env var doesn't affect behavior."""
+        clear_cache()
+        monkeypatch.delenv("RIG_LESSONS_EXTRA_DIRS", raising=False)
+
+        # Should work normally
+        default_dirs = LessonIndex._default_dirs()
+        assert isinstance(default_dirs, list)
+
+
+class TestWorktreeExclusion:
+    """Test that lessons in worktree directories are excluded."""
+
+    def test_worktree_lessons_excluded(self, tmp_path):
+        """Lessons in worktree/ subdirectories should be excluded."""
+        clear_cache()
+        from rig.lessons.index import LessonIndex
+
+        # Create a normal lesson
+        normal_lesson = tmp_path / "normal.md"
+        normal_lesson.write_text(
+            "---\nmatch:\n  keywords: [normal]\n---\n# Normal Lesson\n\nContent."
+        )
+
+        # Create a worktree subdirectory with a lesson
+        worktree_dir = tmp_path / "worktree" / "some-branch" / "lessons"
+        worktree_dir.mkdir(parents=True)
+        worktree_lesson = worktree_dir / "worktree-lesson.md"
+        worktree_lesson.write_text(
+            "---\nmatch:\n  keywords: [worktree]\n---\n# Worktree Lesson\n\nContent."
+        )
+
+        # Index should only include the normal lesson, not the worktree one
+        index = LessonIndex(lesson_dirs=[tmp_path])
+
+        lesson_names = [lesson.title for lesson in index.lessons]
+        assert "Normal Lesson" in lesson_names
+        assert "Worktree Lesson" not in lesson_names
+        assert len(index.lessons) == 1
+
+    def test_git_directory_excluded(self, tmp_path):
+        """Lessons in .git directories should be excluded."""
+        clear_cache()
+        from rig.lessons.index import LessonIndex
+
+        # Create a normal lesson
+        normal_lesson = tmp_path / "normal.md"
+        normal_lesson.write_text(
+            "---\nmatch:\n  keywords: [normal]\n---\n# Normal Lesson\n\nContent."
+        )
+
+        # Create a .git subdirectory with a lesson (shouldn't happen but test it)
+        git_dir = tmp_path / ".git" / "hooks"
+        git_dir.mkdir(parents=True)
+        git_lesson = git_dir / "some-file.md"
+        git_lesson.write_text(
+            "---\nmatch:\n  keywords: [git]\n---\n# Git Lesson\n\nContent."
+        )
+
+        # Index should only include the normal lesson
+        index = LessonIndex(lesson_dirs=[tmp_path])
+
+        lesson_names = [lesson.title for lesson in index.lessons]
+        assert "Normal Lesson" in lesson_names
+        assert "Git Lesson" not in lesson_names
+        assert len(index.lessons) == 1

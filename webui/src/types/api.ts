@@ -1,0 +1,159 @@
+import type { Message, StreamingMessage } from './conversation';
+
+// Server connection health summary (from /api/v2/server/health)
+export interface ServerHealthSlot {
+  id: string;
+  generating: boolean;
+  elapsed_seconds: number | null;
+}
+
+export interface ServerHealth {
+  session_count: number;
+  generating_count: number;
+  idle_count: number;
+  health: 'green' | 'yellow' | 'red';
+  slots: ServerHealthSlot[];
+}
+
+// Active server-side session (from /api/v2/sessions)
+export interface ActiveSession {
+  id: string;
+  conversation_id: string | null;
+  model: string | null;
+  message_count: number;
+  generating: boolean;
+  elapsed_seconds: number | null;
+  created_at: string;
+  last_activity: string;
+}
+
+// External session catalog item (from /api/v2/external-sessions)
+export interface ExternalSessionCatalogItem {
+  id: string;
+  session_id: string;
+  harness: string;
+  session_name: string | null;
+  project: string | null;
+  model: string | null;
+  started_at: string | null;
+  last_activity: string | null;
+  capabilities: string[];
+  trajectory_path: string;
+}
+
+// Normalized transcript message (see rig_sessions.transcript.NormalizedMessage)
+export interface NormalizedMessage {
+  role: 'user' | 'assistant' | 'system' | 'tool_result';
+  // Server's to_dict() omits falsy fields, so a tool-call-only turn has no content.
+  content?: string;
+  timestamp?: string;
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  tool_result?: string;
+  is_error?: boolean;
+}
+
+// External session detail (from /api/v2/external-sessions/:id)
+export interface ExternalSessionDetail {
+  id: string;
+  transcript: Record<string, unknown> & { messages?: NormalizedMessage[] };
+}
+
+export interface ApiErrorDetails {
+  message?: string;
+  type?: string;
+  code?: string;
+  status?: number;
+  [key: string]: unknown;
+}
+
+// Error response from any endpoint
+export interface ApiError {
+  error: string | ApiErrorDetails;
+  status?: number;
+}
+
+// Request to create a conversation
+export interface CreateConversationRequest {
+  messages: Message[];
+  config?: {
+    chat?: {
+      model?: string;
+      stream?: boolean;
+      workspace?: string;
+    };
+  };
+}
+
+// Request to send a message
+export interface SendMessageRequest extends Message {
+  branch?: string;
+}
+
+// Agent info returned with conversation
+export interface AgentInfo {
+  name: string;
+  avatar?: string;
+}
+
+// User identity info from global config
+export interface UserInfo {
+  name: string;
+  avatar?: string;
+}
+
+// Response from /api/conversations/<logfile>
+export interface ConversationResponse {
+  id: string;
+  name: string;
+  log: (Message | StreamingMessage)[];
+  logfile: string;
+  logdir?: string;
+  branches: Record<string, Message[]>;
+  workspace: string;
+  agent?: AgentInfo;
+  // Pagination metadata (only present when limit param was used)
+  total_messages?: number;
+  has_more?: boolean;
+  // Cursor for the next older page = absolute index of log[0] (present when has_more=true)
+  before?: number;
+}
+
+export enum ToolFormat {
+  MARKDOWN = 'markdown',
+  XML = 'xml',
+  TOOL = 'tool',
+}
+
+export interface McpServerConfig {
+  name: string;
+  enabled: boolean;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+export interface McpConfig {
+  enabled: boolean;
+  auto_start: boolean;
+  servers: McpServerConfig[];
+}
+
+export interface ChatConfig {
+  chat: {
+    name: string | null;
+    model: string | null;
+    tools: string[] | null;
+    tool_format: ToolFormat | null;
+    stream: boolean;
+    interactive: boolean;
+    workspace: string;
+    system_prompt?: string | null;
+    // Sampling overrides. null/undefined = provider/model default.
+    temperature?: number | null;
+    top_p?: number | null;
+    max_tokens?: number | null;
+  };
+  env: Record<string, string>;
+  mcp: McpConfig;
+}

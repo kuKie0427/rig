@@ -1,0 +1,1345 @@
+"""Tests for rig/tools/base.py — foundational tool infrastructure.
+
+Covers: find_json_end, _codeblock_char_ranges, derive_type, callable_signature,
+ToolSpec properties/methods, ToolUse formatting/parsing, get_path, load_from_file.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal, Union
+
+import pytest
+
+from rig.hooks import HookType
+from rig.message import Message
+from rig.tools._allowlist import (
+    allowlist_contains_glob,
+    is_hint_pattern,
+    matching_allowlist_tools,
+    tool_matches_allowlist,
+)
+from rig.tools.base import (
+    Parameter,
+    ToolFunction,
+    ToolSpec,
+    ToolUse,
+    _codeblock_char_ranges,
+    callable_signature,
+    derive_type,
+    find_json_end,
+    get_path,
+    get_tool_format,
+    load_from_file,
+    set_tool_format,
+)
+
+# ── find_json_end ──────────────────────────────────────────────────
+
+
+class TestFindJsonEnd:
+    def test_simple_object(self):
+        s = '{"key": "value"}'
+        assert find_json_end(s, 0) == len(s)
+
+    def test_nested_objects(self):
+        s = '{"a": {"b": {"c": 1}}}'
+        assert find_json_end(s, 0) == len(s)
+
+    def test_with_preceding_text(self):
+        s = 'prefix {"key": "val"} suffix'
+        assert find_json_end(s, 7) == 21
+
+    def test_string_with_braces(self):
+        s = '{"code": "if (x) { return }"}'
+        assert find_json_end(s, 0) == len(s)
+
+    def test_escaped_quotes_in_string(self):
+        s = '{"msg": "say \\"hello\\""}'
+        assert find_json_end(s, 0) == len(s)
+
+    def test_empty_object(self):
+        s = "{}"
+        assert find_json_end(s, 0) == 2
+
+    def test_incomplete_json(self):
+        s = '{"key": "value"'
+        assert find_json_end(s, 0) is None
+
+    def test_closing_brace_before_open(self):
+        s = "}"
+        assert find_json_end(s, 0) is None
+
+
+# ── _codeblock_char_ranges ─────────────────────────────────────────
+
+
+class TestCodeblockCharRanges:
+    def test_single_codeblock(self):
+        content = "before\n```python\ncode\n```\nafter"
+        ranges = _codeblock_char_ranges(content)
+        assert len(ranges) == 1
+        start, end = ranges[0]
+        assert "```python" in content[start:end]
+        assert "code" in content[start:end]
+
+    def test_multiple_codeblocks(self):
+        content = "```py\na\n```\ntext\n```js\nb\n```"
+        ranges = _codeblock_char_ranges(content)
+        assert len(ranges) == 2
+
+    def test_no_codeblocks(self):
+        assert _codeblock_char_ranges("just regular text") == []
+
+    def test_unclosed_codeblock(self):
+        content = "```python\ncode without closing"
+        ranges = _codeblock_char_ranges(content)
+        assert len(ranges) == 0
+
+    def test_mismatched_fence_lengths(self):
+        # ````python should match ```` not ```
+        content = "````python\ncode\n````"
+        ranges = _codeblock_char_ranges(content)
+        assert len(ranges) == 1
+
+    def test_fence_with_extra_text_not_closing(self):
+        # A fence with text after backticks is NOT a closing fence
+        content = "```python\ncode\n``` extra text\n```"
+        ranges = _codeblock_char_ranges(content)
+        # The first ``` opens, "``` extra text" is NOT a close (has trailing text),
+        # the bare ``` is the actual close
+        assert len(ranges) == 1
+
+
+# ── extract_json ───────────────────────────────────────────────────
+
+
+class TestExtractJson:
+    def test_basic(self):
+        content = '@tool(id): {"key": "val"} rest'
+        json_start = content.index("{")
+        json_end = find_json_end(content, json_start)
+        assert json_end is not None
+        result = content[json_start:json_end]
+        assert result == '{"key": "val"}'
+
+
+# ── derive_type ────────────────────────────────────────────────────
+
+
+class TestDeriveType:
+    def test_none_value(self):
+        assert derive_type(None) == "None"
+
+    def test_string_annotation(self):
+        assert derive_type("MyType") == "MyType"
+
+    def test_basic_types(self):
+        assert derive_type(str) == "str"
+        assert derive_type(int) == "int"
+        assert derive_type(bool) == "bool"
+
+    def test_nonetype(self):
+        assert derive_type(type(None)) == "None"
+
+    def test_literal_type(self):
+        result = derive_type(Literal["a", "b", "c"])
+        assert "Literal" in result
+        assert '"a"' in result
+        assert '"b"' in result
+        assert '"c"' in result
+
+    def test_union_type(self):
+        result = derive_type(Union[str, int])  # noqa: UP007
+        assert "Union" in result
+        assert "str" in result
+        assert "int" in result
+
+    def test_list_instance(self):
+        result = derive_type([str, int])
+        assert result == "[str, int]"
+
+    def test_generic_list(self):
+        result = derive_type(list[int])
+        assert "list" in result
+        assert "int" in result
+
+    def test_generic_dict(self):
+        result = derive_type(dict[str, int])
+        assert "dict" in result
+        assert "str" in result
+        assert "int" in result
+
+
+# ── callable_signature ─────────────────────────────────────────────
+
+
+class TestCallableSignature:
+    def test_simple_function(self):
+        def greet(name: str) -> str:
+            return ""
+
+        sig = callable_signature(greet)
+        assert "greet" in sig
+        assert "name: str" in sig
+        assert "-> str" in sig
+
+    def test_no_return_type(self):
+        def no_ret(x: int):
+            pass
+
+        sig = callable_signature(no_ret)
+        assert sig == "no_ret(x: int)"
+
+    def test_multiple_args(self):
+        def multi(a: str, b: int, c: bool) -> None:
+            pass
+
+        sig = callable_signature(multi)
+        assert "a: str" in sig
+        assert "b: int" in sig
+        assert "c: bool" in sig
+        assert "-> None" in sig
+
+    def test_no_annotations(self):
+        def bare():
+            pass
+
+        sig = callable_signature(bare)
+        assert sig == "bare()"
+
+
+# ── ToolFunction ──────────────────────────────────────────────────
+
+
+class TestToolFunction:
+    def test_from_callable_infers_name(self):
+        def my_func(x: int) -> str:
+            """Does something."""
+            return ""
+
+        tf = ToolFunction.from_callable(my_func)
+        assert tf.name == "my_func"
+
+    def test_from_callable_infers_description(self):
+        def documented(x: int) -> str:
+            """This is a docstring."""
+            return ""
+
+        tf = ToolFunction.from_callable(documented)
+        assert tf.description == "This is a docstring."
+
+    def test_from_callable_no_docstring(self):
+        def nodoc():
+            pass
+
+        tf = ToolFunction.from_callable(nodoc)
+        assert tf.description == ""
+
+    def test_from_callable_group(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn, group="discord")
+        assert tf.group == "discord"
+
+    def test_default_hints_empty(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.hints == frozenset()
+
+    def test_explicit_hints(self):
+        def fn():
+            pass
+
+        tf = ToolFunction(name="fn", fn=fn, hints=frozenset({"read-only"}))
+        assert "read-only" in tf.hints
+
+    def test_fn_is_callable(self):
+        def adder(a: int, b: int) -> int:
+            return a + b
+
+        tf = ToolFunction.from_callable(adder)
+        assert tf.fn(2, 3) == 5
+
+    def test_frozen(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        with pytest.raises((AttributeError, TypeError)):
+            tf.name = "new_name"  # type: ignore[misc]
+
+    def test_functions_description_uses_toolfunction_metadata(self):
+        def helper(name: str) -> bool:
+            """Checks a name."""
+            return True
+
+        tf = ToolFunction.from_callable(helper)
+        spec = ToolSpec(name="t", desc="", functions=[tf])
+        desc = spec.get_functions_description()
+        assert "helper" in desc
+        assert "Checks a name" in desc
+
+    def test_functions_description_explicit_description(self):
+        def helper(name: str) -> bool:
+            return True
+
+        tf = ToolFunction(name="helper", fn=helper, description="Custom description")
+        spec = ToolSpec(name="t", desc="", functions=[tf])
+        desc = spec.get_functions_description()
+        assert "Custom description" in desc
+
+    def test_from_callable_extracts_parameters(self):
+        def greet(name: str, repeat: int) -> str:
+            """Say hello."""
+            return f"hello {name}" * repeat
+
+        tf = ToolFunction.from_callable(greet)
+        assert len(tf.parameters) == 2
+        assert tf.parameters[0].name == "name"
+        assert tf.parameters[0].type == "str"
+        assert tf.parameters[0].required is True
+        assert tf.parameters[1].name == "repeat"
+        assert tf.parameters[1].type == "int"
+
+    def test_from_callable_optional_parameter(self):
+        def fn(path: str, encoding: str = "utf-8") -> str:
+            return ""
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters[0].required is True
+        assert tf.parameters[1].required is False
+
+    def test_from_callable_unannotated_parameter(self):
+        def fn(x) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters[0].type == "any"
+
+    def test_from_callable_description_first_paragraph_only(self):
+        def fn() -> None:
+            """First paragraph.
+
+            Second paragraph with details.
+            """
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.description == "First paragraph."
+        assert "Second paragraph" not in tf.description
+
+    def test_from_callable_no_params(self):
+        def fn() -> str:
+            return "ok"
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters == []
+
+    def test_from_callable_skips_variadic(self):
+        def fn(*args: str, **kwargs: str) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters == []
+
+    def test_from_callable_skips_variadic_mixed(self):
+        def fn(name: str, *args: str, flag: bool = False, **kwargs: str) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        names = [p.name for p in tf.parameters]
+        assert "name" in names
+        assert "flag" in names
+        assert "args" not in names
+        assert "kwargs" not in names
+
+
+# ── ToolSpec ───────────────────────────────────────────────────────
+
+
+class TestToolSpec:
+    @pytest.fixture
+    def basic_tool(self):
+        return ToolSpec(
+            name="test_tool",
+            desc="A test tool",
+            instructions="Use this tool for testing",
+        )
+
+    @pytest.fixture
+    def tool_with_execute(self):
+        def execute(code, args, kwargs):
+            pass
+
+        return ToolSpec(
+            name="runnable",
+            desc="Runnable tool",
+            execute=execute,
+        )
+
+    def test_repr(self, basic_tool):
+        assert repr(basic_tool) == "ToolSpec(test_tool)"
+
+    def test_eq_same_name(self):
+        a = ToolSpec(name="x", desc="a")
+        b = ToolSpec(name="x", desc="b")
+        assert a == b
+
+    def test_eq_different_name(self):
+        a = ToolSpec(name="x", desc="a")
+        b = ToolSpec(name="y", desc="a")
+        assert a != b
+
+    def test_eq_non_toolspec(self, basic_tool):
+        assert basic_tool != "not a toolspec"
+
+    def test_lt_by_priority(self):
+        low = ToolSpec(name="a", desc="", load_priority=0)
+        high = ToolSpec(name="b", desc="", load_priority=10)
+        assert low < high
+
+    def test_lt_by_name_same_priority(self):
+        a = ToolSpec(name="alpha", desc="")
+        b = ToolSpec(name="beta", desc="")
+        assert a < b
+
+    def test_lt_non_toolspec(self, basic_tool):
+        assert basic_tool.__lt__("string") == NotImplemented
+
+    def test_is_available_bool(self):
+        available = ToolSpec(name="t", desc="", available=True)
+        unavailable = ToolSpec(name="t", desc="", available=False)
+        assert available.is_available is True
+        assert unavailable.is_available is False
+
+    def test_is_available_callable(self):
+        tool = ToolSpec(name="t", desc="", available=lambda: True)
+        assert tool.is_available is True
+        tool_no = ToolSpec(name="t", desc="", available=lambda: False)
+        assert tool_no.is_available is False
+
+    def test_is_runnable(self, basic_tool, tool_with_execute):
+        assert basic_tool.is_runnable is False
+        assert tool_with_execute.is_runnable is True
+
+    def test_get_instructions_basic(self, basic_tool):
+        result = basic_tool.get_instructions("markdown")
+        assert "Use this tool for testing" in result
+
+    def test_get_instructions_format_override(self):
+        tool = ToolSpec(
+            name="t",
+            desc="",
+            instructions="general",
+            instructions_format={"xml": "xml-specific"},
+        )
+        assert "xml-specific" in tool.get_instructions("xml")
+        assert "general" in tool.get_instructions("markdown")
+
+    def test_get_instructions_with_functions(self):
+        def my_func(x: int) -> str:
+            """Does something."""
+            return ""
+
+        tool = ToolSpec(
+            name="t", desc="", functions=[ToolFunction.from_callable(my_func)]
+        )
+        result = tool.get_instructions("markdown")
+        assert "my_func" in result
+        assert "Does something" in result
+
+    def test_get_functions_description(self):
+        def helper(name: str) -> bool:
+            """Checks a name."""
+            return True
+
+        tool = ToolSpec(
+            name="t", desc="", functions=[ToolFunction.from_callable(helper)]
+        )
+        desc = tool.get_functions_description()
+        assert "helper" in desc
+        assert "Checks a name" in desc
+
+    def test_get_functions_description_no_functions(self):
+        tool = ToolSpec(name="t", desc="")
+        assert tool.get_functions_description() == "None"
+
+    def test_bare_callable_functions_normalized(self):
+        # The documented plugin API (docs/plugins.rst) passes bare callables in
+        # `functions`. ToolSpec must normalize them to ToolFunction so consumers
+        # (python.init, get_functions_description, as_function_subtoolspecs) work.
+        def my_func(x: int) -> str:
+            """Does something."""
+            return ""
+
+        tool = ToolSpec(name="t", desc="", functions=[my_func])
+        assert tool.functions is not None
+        assert isinstance(tool.functions[0], ToolFunction)
+        assert tool.functions[0].fn is my_func
+        assert tool.functions[0].name == "my_func"
+
+    def test_mixed_callable_and_toolfunction_normalized(self):
+        def bare(x: int) -> str:
+            return ""
+
+        def wrapped(y: int) -> str:
+            return ""
+
+        tool = ToolSpec(
+            name="t",
+            desc="",
+            functions=[bare, ToolFunction.from_callable(wrapped)],
+        )
+        assert tool.functions is not None
+        assert all(isinstance(f, ToolFunction) for f in tool.functions)
+        assert {f.name for f in tool.functions} == {"bare", "wrapped"}
+
+    def test_bare_callable_functions_work_in_description(self):
+        def helper(name: str) -> bool:
+            """Checks a name."""
+            return True
+
+        # Pass the bare callable, as a plugin would
+        tool = ToolSpec(name="t", desc="", functions=[helper])
+        desc = tool.get_functions_description()
+        assert "helper" in desc
+        assert "Checks a name" in desc
+
+    def test_get_examples_string(self):
+        tool = ToolSpec(name="t", desc="", examples="example usage")
+        assert "example usage" in tool.get_examples()
+
+    def test_get_examples_callable(self):
+        tool = ToolSpec(
+            name="t",
+            desc="",
+            examples=lambda fmt: f"example for {fmt}",
+        )
+        assert "example for markdown" in tool.get_examples("markdown")
+        assert "example for xml" in tool.get_examples("xml")
+
+    def test_get_tool_prompt_markdown(self, basic_tool):
+        prompt = basic_tool.get_tool_prompt(examples=False, tool_format="markdown")
+        assert "## test_tool" in prompt
+        assert "A test tool" in prompt
+        assert "Use this tool for testing" in prompt
+
+    def test_get_tool_prompt_xml(self, basic_tool):
+        prompt = basic_tool.get_tool_prompt(examples=False, tool_format="xml")
+        assert '<tool name="test_tool">' in prompt
+        assert "A test tool" in prompt
+        assert "</tool>" in prompt
+
+    def test_get_doc_with_instructions(self, basic_tool):
+        doc = basic_tool.get_doc("Existing doc.")
+        assert "Existing doc." in doc
+        assert "Instructions" in doc
+
+    def test_get_doc_no_existing(self, basic_tool):
+        doc = basic_tool.get_doc()
+        assert "Instructions" in doc
+
+    def test_hints_default_empty(self):
+        tool = ToolSpec(name="t", desc="")
+        assert tool.hints == frozenset()
+
+    def test_hints_explicit(self):
+        tool = ToolSpec(name="t", desc="", hints=frozenset({"read-only", "idempotent"}))
+        assert "read-only" in tool.hints
+        assert "idempotent" in tool.hints
+
+
+# ── ToolSpec.from_function ─────────────────────────────────────────
+
+
+class TestToolSpecFromFunction:
+    def test_basic_metadata(self):
+        def greet(name: str) -> str:
+            """Greet someone by name."""
+            return f"Hello, {name}!"
+
+        spec = ToolSpec.from_function(greet)
+        assert spec.name == "greet"
+        assert spec.desc == "Greet someone by name."
+
+    def test_parameters_extracted(self):
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        spec = ToolSpec.from_function(add)
+        assert len(spec.parameters) == 2
+        assert spec.parameters[0].name == "a"
+        assert spec.parameters[0].type == "int"
+        assert spec.parameters[0].required is True
+        assert spec.parameters[1].name == "b"
+
+    def test_execute_via_kwargs(self):
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return int(a) + int(b)
+
+        spec = ToolSpec.from_function(add)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, {"a": "3", "b": "4"}))  # type: ignore[arg-type]
+        assert any("7" in m.content for m in msgs)
+
+    def test_execute_via_positional_args(self):
+        def echo(text: str) -> str:
+            """Echo text back."""
+            return text
+
+        spec = ToolSpec.from_function(echo)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, ["hello"], None))  # type: ignore[arg-type]
+        assert any("hello" in m.content for m in msgs)
+
+    def test_execute_returns_none_produces_no_message(self):
+        def noop() -> None:
+            pass
+
+        spec = ToolSpec.from_function(noop)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, None))  # type: ignore[arg-type]
+        assert msgs == []
+
+    def test_no_ipython_import(self):
+        """from_function path must not trigger an IPython import."""
+        import sys
+
+        def fn(x: str) -> str:
+            """Returns x."""
+            return x
+
+        before = "IPython" in sys.modules
+        ToolSpec.from_function(fn)
+        after = "IPython" in sys.modules
+        # IPython should not have been newly imported by from_function
+        assert before == after
+
+    def test_is_runnable(self):
+        def fn(x: str) -> str:
+            return x
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.is_runnable
+
+    def test_execute_positional_only_via_kwargs(self):
+        """Positional-only params must not cause TypeError when called via kwargs."""
+
+        def fn(x: str, /) -> str:
+            return f"got:{x}"
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, {"x": "hello"}))  # type: ignore[arg-type]
+        assert any("got:hello" in m.content for m in msgs)
+
+    def test_execute_positional_only_via_args(self):
+        """Positional-only params work via the positional-args path too."""
+
+        def fn(x: str, /) -> str:
+            return f"got:{x}"
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, ["world"], None))  # type: ignore[arg-type]
+        assert any("got:world" in m.content for m in msgs)
+
+
+# ── ToolSpec.as_function_subtoolspecs ─────────────────────────────
+
+
+class TestAsFunctionSubtoolspecs:
+    def test_empty_when_no_functions(self):
+        tool = ToolSpec(name="browser", desc="")
+        assert tool.as_function_subtoolspecs() == []
+
+    def test_one_subtool_per_function(self):
+        def view(url: str) -> str:
+            """View a URL."""
+            return url
+
+        def screenshot() -> str:
+            """Take a screenshot."""
+            return "ok"
+
+        tool = ToolSpec(
+            name="browser",
+            desc="",
+            functions=[
+                ToolFunction.from_callable(view),
+                ToolFunction.from_callable(screenshot),
+            ],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert len(subs) == 2
+
+    def test_subtool_names_are_qualified(self):
+        def view(url: str) -> str:
+            """View a URL."""
+            return url
+
+        tool = ToolSpec(
+            name="browser",
+            desc="",
+            functions=[ToolFunction.from_callable(view)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert subs[0].name == "browser.view"
+
+    def test_subtool_is_runnable(self):
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"hi {name}"
+
+        tool = ToolSpec(
+            name="chat",
+            desc="",
+            functions=[ToolFunction.from_callable(greet)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert subs[0].is_runnable
+
+    def test_subtool_executes_without_ipython(self):
+        """Functions in sub-toolspecs must run without importing IPython."""
+        import sys
+
+        def double(n: str) -> str:
+            """Double a number string."""
+            return str(int(n) * 2)
+
+        tool = ToolSpec(
+            name="math",
+            desc="",
+            functions=[ToolFunction.from_callable(double)],
+        )
+        before = "IPython" in sys.modules
+        subs = tool.as_function_subtoolspecs()
+        after = "IPython" in sys.modules
+        assert before == after, "IPython must not be imported during subtool expansion"
+
+        sub = subs[0]
+        assert sub.execute is not None
+        msgs = list(sub.execute(None, None, {"n": "6"}))  # type: ignore[arg-type]
+        assert any("12" in m.content for m in msgs)
+
+    def test_subtool_inherits_hints(self):
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tf = ToolFunction(
+            name="read_channel",
+            fn=read_channel,
+            hints=frozenset({"read-only"}),
+        )
+        tool = ToolSpec(name="discord", desc="", functions=[tf])
+        subs = tool.as_function_subtoolspecs()
+        assert "read-only" in subs[0].hints
+
+    def test_subtool_name_allows_glob_allowlist(self):
+        """Sub-tool names like discord.read_channel match 'discord.*' patterns."""
+        from rig.tools._allowlist import tool_matches_allowlist
+
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tool = ToolSpec(
+            name="discord",
+            desc="",
+            functions=[ToolFunction.from_callable(read_channel)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert tool_matches_allowlist(subs[0].name, ["discord.*"])
+
+    def test_subtool_honours_custom_description_and_parameters(self):
+        """Custom description/parameters on ToolFunction must not be discarded."""
+
+        def fn(x: str) -> str:
+            """Auto-derived description (should be overridden)."""
+            return x
+
+        custom_param = Parameter(name="x", type="string", description="The input value")
+        tf = ToolFunction(
+            name="fn",
+            fn=fn,
+            description="Richer prose description",
+            parameters=[custom_param],
+        )
+        tool = ToolSpec(name="mytool", desc="", functions=[tf])
+        subs = tool.as_function_subtoolspecs()
+        sub = subs[0]
+        assert sub.desc == "Richer prose description"
+        assert len(sub.parameters) == 1
+        assert sub.parameters[0].description == "The input value"
+
+    def test_subtool_inherits_parent_availability_guard(self):
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tool = ToolSpec(
+            name="discord",
+            desc="",
+            available=lambda: False,
+            functions=[ToolFunction.from_callable(read_channel)],
+        )
+
+        subs = tool.as_function_subtoolspecs()
+
+        assert subs[0].available is tool.available
+        assert subs[0].is_available is False
+
+
+# ── Hint-based allowlist ───────────────────────────────────────────
+
+
+def _make_tool(name: str, hints: frozenset[str] = frozenset()) -> ToolSpec:
+    return ToolSpec(name=name, desc="", hints=hints)
+
+
+class TestIsHintPattern:
+    def test_hint_prefix_recognized(self):
+        assert is_hint_pattern("hint:read-only")
+
+    def test_bare_name_not_hint(self):
+        assert not is_hint_pattern("shell")
+
+    def test_glob_not_hint(self):
+        assert not is_hint_pattern("discord.*")
+
+
+class TestAllowlistContainsGlob:
+    def test_plain_names_no_glob(self):
+        assert not allowlist_contains_glob(["shell", "save"])
+
+    def test_star_glob(self):
+        assert allowlist_contains_glob(["discord.*"])
+
+    def test_hint_pattern_treated_as_glob(self):
+        # hint patterns implicitly match multiple tools, so suppress MCP warnings
+        assert allowlist_contains_glob(["hint:read-only", "shell"])
+
+    def test_question_mark_glob(self):
+        assert allowlist_contains_glob(["tool?"])
+
+
+class TestMatchingAllowlistToolsHints:
+    def test_hint_pattern_matches_tool_with_hint(self):
+        t = _make_tool("discord.list", frozenset({"read-only"}))
+        result = matching_allowlist_tools("hint:read-only", [t])
+        assert t in result
+
+    def test_hint_pattern_misses_tool_without_hint(self):
+        t = _make_tool("discord.send", frozenset())
+        result = matching_allowlist_tools("hint:read-only", [t])
+        assert result == []
+
+    def test_name_pattern_still_works(self):
+        t = _make_tool("shell")
+        result = matching_allowlist_tools("shell", [t])
+        assert t in result
+
+    def test_glob_pattern_still_works(self):
+        tools = [
+            _make_tool("discord.send"),
+            _make_tool("discord.list"),
+            _make_tool("shell"),
+        ]
+        result = matching_allowlist_tools("discord.*", tools)
+        assert len(result) == 2
+        assert all(t.name.startswith("discord.") for t in result)
+
+
+class TestToolMatchesAllowlistHints:
+    def test_name_match(self):
+        assert tool_matches_allowlist("shell", ["shell"])
+
+    def test_glob_match(self):
+        assert tool_matches_allowlist("discord.send", ["discord.*"])
+
+    def test_hint_match(self):
+        assert tool_matches_allowlist(
+            "discord.list", ["hint:read-only"], frozenset({"read-only"})
+        )
+
+    def test_hint_no_match_wrong_hint(self):
+        assert not tool_matches_allowlist(
+            "discord.send", ["hint:read-only"], frozenset({"destructive"})
+        )
+
+    def test_hint_no_match_no_hints(self):
+        assert not tool_matches_allowlist(
+            "discord.send", ["hint:read-only"], frozenset()
+        )
+
+    def test_hint_match_in_mixed_allowlist(self):
+        # 'hint:read-only' should match even when other entries don't
+        assert tool_matches_allowlist(
+            "some_tool", ["shell", "hint:read-only"], frozenset({"read-only"})
+        )
+
+    def test_name_match_beats_hint_miss(self):
+        # name matches even if hint doesn't
+        assert tool_matches_allowlist("shell", ["shell", "hint:read-only"], frozenset())
+
+
+# ── ToolUse formatting ─────────────────────────────────────────────
+
+
+class TestToolUseFormatting:
+    def test_to_markdown(self):
+        tu = ToolUse("shell", ["bash"], "echo hello", start=0)
+        result = tu.to_output("markdown")
+        assert result == "```shell bash\necho hello\n```"
+
+    def test_to_markdown_no_args(self):
+        tu = ToolUse("ipython", [], "print(1)", start=0)
+        result = tu.to_output("markdown")
+        assert result == "```ipython\nprint(1)\n```"
+
+    def test_to_xml(self):
+        tu = ToolUse("shell", ["bash"], "echo hello", start=0)
+        result = tu.to_output("xml")
+        assert "<tool-use>" in result
+        assert "<shell" in result
+        assert "echo hello" in result
+        assert "</shell>" in result
+        assert "</tool-use>" in result
+
+    def test_to_xml_escapes_content(self):
+        tu = ToolUse("shell", [], "echo '<html>'", start=0)
+        result = tu.to_output("xml")
+        assert "&lt;html&gt;" in result
+
+    def test_to_xml_escapes_args(self):
+        tu = ToolUse("save", ['file "name".py'], "content", start=0)
+        result = tu.to_output("xml")
+        # quoteattr wraps in single-quotes when the value contains double-quotes
+        assert "args='file \"name\".py'" in result
+
+    def test_execute_on_result_message_excludes_hook_messages(self, monkeypatch):
+        actual_output = Message("system", "actual output")
+
+        def execute(code, args, kwargs):
+            yield actual_output
+
+        fake_tool = ToolSpec(name="test_tool", desc="test", execute=execute)
+
+        def fake_trigger_hook(hook_type, data):
+            if hook_type == HookType.TOOL_EXECUTE_PRE:
+                return [Message("system", "pre hook")]
+            if hook_type == HookType.TOOL_EXECUTE_POST:
+                return [Message("system", "post hook")]
+            return []
+
+        monkeypatch.setattr("rig.tools.get_tool", lambda name: fake_tool)
+        monkeypatch.setattr("rig.hooks.trigger_hook", fake_trigger_hook)
+
+        streamed: list[Message] = []
+        yielded = list(
+            ToolUse("test_tool", [], None, start=0).execute(
+                on_result_message=streamed.append
+            )
+        )
+
+        assert [msg.content for msg in yielded] == [
+            "pre hook",
+            "actual output",
+            "post hook",
+        ]
+        assert streamed == [actual_output]
+
+    def test_execute_on_result_message_streams_generator_progressively(
+        self, monkeypatch
+    ):
+        first_output = Message("system", "first output")
+        second_output = Message("system", "second output")
+        events: list[str] = []
+
+        def execute(code, args, kwargs):
+            events.append("tool:start")
+            yield first_output
+            events.append("tool:between")
+            yield second_output
+            events.append("tool:end")
+
+        fake_tool = ToolSpec(name="test_tool", desc="test", execute=execute)
+
+        monkeypatch.setattr("rig.tools.get_tool", lambda name: fake_tool)
+        monkeypatch.setattr("rig.hooks.trigger_hook", lambda hook_type, data: [])
+
+        streamed: list[Message] = []
+
+        def on_result_message(msg: Message) -> None:
+            events.append(f"callback:{msg.content}")
+            streamed.append(msg)
+
+        yielded = list(
+            ToolUse("test_tool", [], None, start=0).execute(
+                on_result_message=on_result_message
+            )
+        )
+
+        assert yielded == [first_output, second_output]
+        assert streamed == [first_output, second_output]
+        assert events == [
+            "tool:start",
+            "callback:first output",
+            "tool:between",
+            "callback:second output",
+            "tool:end",
+        ]
+
+
+# ── ToolUse._iter_from_xml ─────────────────────────────────────────
+
+
+class TestToolUseXmlParsing:
+    def test_rig_format(self):
+        content = """<tool-use>
+<shell>
+echo hello
+</shell>
+</tool-use>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 1
+        assert uses[0].tool == "shell"
+        assert uses[0].content is not None
+        assert "echo hello" in uses[0].content
+
+    def test_haiku_format(self):
+        content = """<function_calls>
+<invoke name="shell">
+echo world
+</invoke>
+</function_calls>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 1
+        assert uses[0].tool == "shell"
+        assert uses[0].content is not None
+        assert "echo world" in uses[0].content
+
+    def test_no_xml_tags(self):
+        content = "just regular text"
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 0
+
+    def test_multiple_tools_rig_format(self):
+        content = """<tool-use>
+<shell>ls</shell>
+<ipython>print(1)</ipython>
+</tool-use>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 2
+        names = {u.tool for u in uses}
+        assert "shell" in names
+        assert "ipython" in names
+
+    def test_haiku_missing_name(self):
+        content = """<function_calls>
+<invoke>
+no name
+</invoke>
+</function_calls>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 0
+
+    def test_start_position_not_negative(self):
+        """start should be None (not -1) when tag can't be found in original content."""
+        content = """<tool-use>
+<shell>
+echo hello
+</shell>
+</tool-use>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 1
+        # start should be a non-negative int or None, never -1
+        assert uses[0].start is None or uses[0].start >= 0
+
+    def test_start_position_found(self):
+        """start should point to the actual tag location in the content."""
+        content = """some text <tool-use>
+<shell>
+echo hello
+</shell>
+</tool-use>"""
+        uses = list(ToolUse._iter_from_xml(content))
+        assert len(uses) == 1
+        assert uses[0].start is not None
+        assert uses[0].start >= 0
+        assert content[uses[0].start :].startswith("<shell")
+
+
+# ── ToolUse.iter_from_content (tool format) ────────────────────────
+
+
+class TestToolUseToolFormat:
+    def test_tool_call_parsing(self):
+        content = '@shell(call-1): {"command": "echo hi"}'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        # Should find at least the tool-format call
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool == "shell"
+        assert tool_calls[0].call_id == "call-1"
+        assert tool_calls[0].kwargs == {"command": "echo hi"}
+
+    def test_tool_call_parsing_allows_dotted_tool_names(self):
+        content = '@browser.view(call-1): {"url": "https://example.com"}'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool == "browser.view"
+        assert tool_calls[0].call_id == "call-1"
+        assert tool_calls[0].kwargs == {"url": "https://example.com"}
+
+    def test_tool_call_inside_codeblock_skipped(self):
+        content = '```example\n@shell(id-1): {"cmd": "test"}\n```'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 0
+
+    def test_multiple_tool_calls(self):
+        content = '@shell(c1): {"cmd": "ls"}\nsome text\n@ipython(c2): {"code": "1+1"}'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 2
+
+    def test_incomplete_json_stops(self):
+        content = '@shell(c1): {"cmd": "ls"'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 0
+
+
+# ── get_path ───────────────────────────────────────────────────────
+
+
+class TestGetPath:
+    def test_from_args(self):
+        path = get_path("content", ["save test.py"], None)
+        assert path == Path("test.py")
+
+    def test_from_args_with_space(self):
+        path = get_path("content", ["save my file.py"], None)
+        assert path == Path("my file.py")
+
+    def test_from_kwargs(self):
+        path = get_path(None, None, {"path": "/tmp/test.py"})
+        assert path == Path("/tmp/test.py")
+
+    def test_no_path_raises(self):
+        with pytest.raises(ValueError, match="No filename"):
+            get_path(None, None, None)
+
+    def test_tilde_expansion(self):
+        path = get_path(None, None, {"path": "~/test.py"})
+        assert "~" not in str(path)
+
+    def test_append_prefix(self):
+        path = get_path("content", ["append log.txt"], None)
+        assert path == Path("log.txt")
+
+    def test_patch_prefix(self):
+        path = get_path("diff content", ["patch src/main.py"], None)
+        assert path == Path("src/main.py")
+
+
+# ── load_from_file ─────────────────────────────────────────────────
+
+
+class TestLoadFromFile:
+    def test_nonexistent_file(self):
+        with pytest.raises(ValueError, match="does not exist"):
+            load_from_file(Path("/nonexistent/tool.py"))
+
+    def test_directory_not_file(self, tmp_path):
+        with pytest.raises(ValueError, match="not a file"):
+            load_from_file(tmp_path)
+
+    def test_non_py_extension(self, tmp_path):
+        txt_file = tmp_path / "tool.txt"
+        txt_file.write_text("x = 1")
+        with pytest.raises(ValueError, match="must be a .py file"):
+            load_from_file(txt_file)
+
+    def test_load_valid_tool(self, tmp_path):
+        tool_file = tmp_path / "my_tool.py"
+        tool_file.write_text(
+            """
+from rig.tools.base import ToolSpec
+
+my_tool = ToolSpec(name="my_test_tool", desc="A test tool")
+"""
+        )
+        tools = load_from_file(tool_file)
+        assert len(tools) == 1
+        assert tools[0].name == "my_test_tool"
+
+    def test_load_file_no_tools(self, tmp_path):
+        tool_file = tmp_path / "empty_tool.py"
+        tool_file.write_text("x = 42\n")
+        tools = load_from_file(tool_file)
+        assert len(tools) == 0
+
+    def test_load_multiple_tools(self, tmp_path):
+        tool_file = tmp_path / "multi_tool.py"
+        tool_file.write_text(
+            """
+from rig.tools.base import ToolSpec
+
+tool_a = ToolSpec(name="tool_a", desc="First")
+tool_b = ToolSpec(name="tool_b", desc="Second")
+"""
+        )
+        tools = load_from_file(tool_file)
+        assert len(tools) == 2
+        names = {t.name for t in tools}
+        assert "tool_a" in names
+        assert "tool_b" in names
+
+
+# ── set/get tool_format ────────────────────────────────────────────
+
+
+@pytest.fixture()
+def restore_tool_format():
+    original = get_tool_format()
+    yield
+    set_tool_format(original)
+
+
+class TestToolFormat:
+    def test_set_and_get(self, restore_tool_format):
+        set_tool_format("xml")
+        assert get_tool_format() == "xml"
+        set_tool_format("tool")
+        assert get_tool_format() == "tool"
+
+
+# ── Parameter ──────────────────────────────────────────────────────
+
+
+class TestParameter:
+    def test_basic(self):
+        p = Parameter(
+            name="path", type="string", description="File path", required=True
+        )
+        assert p.name == "path"
+        assert p.type == "string"
+        assert p.required is True
+
+    def test_defaults(self):
+        p = Parameter(name="x", type="int")
+        assert p.description is None
+        assert p.enum is None
+        assert p.required is False
+
+    def test_with_enum(self):
+        p = Parameter(name="mode", type="string", enum=["read", "write"])
+        assert p.enum == ["read", "write"]
+
+
+# ── ToolUse._to_params ────────────────────────────────────────────
+
+
+class TestToolUseToParams:
+    def test_kwargs_passthrough(self):
+        tu = ToolUse("shell", None, None, kwargs={"cmd": "ls"}, start=0)
+        assert tu._to_params() == {"cmd": "ls"}
+
+    def test_no_args_no_kwargs(self):
+        tu = ToolUse("shell", None, None, start=0)
+        assert tu._to_params() == {}
+
+
+# ── ToolSpec.get_tool_prompt edge cases ────────────────────────────
+
+
+class TestToolPromptEdgeCases:
+    def test_no_desc(self):
+        tool = ToolSpec(name="t", desc="")
+        prompt = tool.get_tool_prompt(examples=False, tool_format="markdown")
+        assert "## t" in prompt
+        assert "Description" not in prompt
+
+    def test_no_instructions(self):
+        tool = ToolSpec(name="t", desc="desc")
+        prompt = tool.get_tool_prompt(examples=False, tool_format="markdown")
+        assert "Instructions" not in prompt
+
+    def test_xml_no_desc(self):
+        tool = ToolSpec(name="t", desc="")
+        prompt = tool.get_tool_prompt(examples=False, tool_format="xml")
+        assert "<description>" not in prompt
+        assert '<tool name="t">' in prompt
+
+
+# ── Built-in tool hint annotations ─────────────────────────────────
+
+
+class TestBuiltinToolHints:
+    """Verify that core built-in tools carry the expected hint tags."""
+
+    def test_read_tool_is_read_only(self):
+        from rig.tools.read import tool
+
+        assert "read-only" in tool.hints
+        assert "file-ops" in tool.hints
+
+    def test_patch_tool_is_destructive(self):
+        from rig.tools.patch import tool
+
+        assert "destructive" in tool.hints
+        assert "file-ops" in tool.hints
+
+    def test_save_tools_are_destructive(self):
+        from rig.tools.save import tool_append, tool_save
+
+        for t in (tool_save, tool_append):
+            assert "destructive" in t.hints
+            assert "file-ops" in t.hints
+
+    def test_python_tool_hints(self):
+        from rig.tools.python import tool
+
+        assert "code-exec" in tool.hints
+        assert "destructive" in tool.hints
+
+    def test_shell_tool_hints(self):
+        from rig.tools.shell import tool
+
+        assert "code-exec" in tool.hints
+        assert "destructive" in tool.hints
+
+    def test_browser_tool_hint(self):
+        from rig.tools.browser import tool
+
+        assert "web" in tool.hints
+        assert "destructive" in tool.hints
+
+    def test_hint_allowlist_selects_read_only_tools(self):
+        """hint:read-only should match read but not shell."""
+        from rig.tools.read import tool as read_tool
+        from rig.tools.shell import tool as shell_tool
+
+        tools = [read_tool, shell_tool]
+        result = matching_allowlist_tools("hint:read-only", tools)
+        assert read_tool in result
+        assert shell_tool not in result
+
+    def test_hint_allowlist_selects_code_exec_tools(self):
+        """hint:code-exec should match both ipython and shell."""
+        from rig.tools.python import tool as py_tool
+        from rig.tools.shell import tool as shell_tool
+
+        tools = [py_tool, shell_tool]
+        result = matching_allowlist_tools("hint:code-exec", tools)
+        assert py_tool in result
+        assert shell_tool in result

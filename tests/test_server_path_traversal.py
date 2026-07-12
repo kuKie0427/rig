@@ -1,0 +1,783 @@
+"""Tests for path traversal validation on conversation_id and branch names.
+
+Ensures all endpoints that accept conversation_id or branch parameters
+reject path traversal attempts (CWE-22) before any file system operations occur.
+"""
+
+import base64
+
+import pytest
+
+# Minimal valid 1×1 white-pixel PNG, pre-computed so tests don't need PIL.
+# Verified: `PIL.Image.open(io.BytesIO(_VALID_PNG)).format == "PNG"`
+_VALID_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+# Skip if flask not installed
+pytest.importorskip(
+    "flask", reason="flask not installed, install server extras (-E server)"
+)
+
+from flask.testing import FlaskClient  # fmt: skip
+
+pytestmark = [pytest.mark.timeout(10)]
+
+
+# Payloads that bypass Flask's URL routing (no '/' so <string:> matches them).
+# Payloads with '/' are already blocked by Flask routing (<string:> doesn't match '/').
+TRAVERSAL_PAYLOADS = [
+    ".",
+    "..",
+    "test\\..\\..\\secret",
+    "..\\..\\etc\\passwd",
+]
+
+
+def _assert_traversal_rejected(response):
+    """Assert the response is a 400 with the path traversal error message."""
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data["error"] == "Invalid conversation_id"
+
+
+class TestSessionEndpointValidation:
+    """Session API endpoints must reject path traversal in conversation_id."""
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_events_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.get(f"/api/v2/conversations/{payload}/events")
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_step_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(
+            f"/api/v2/conversations/{payload}/step",
+            json={"session_id": "fake"},
+        )
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_tool_confirm_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(
+            f"/api/v2/conversations/{payload}/tool/confirm",
+            json={"tool_id": "fake", "action": "approve"},
+        )
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_rerun_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(f"/api/v2/conversations/{payload}/rerun")
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_elicit_respond_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(
+            f"/api/v2/conversations/{payload}/elicit/respond",
+            json={"elicit_id": "fake", "response": "test"},
+        )
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_interrupt_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(
+            f"/api/v2/conversations/{payload}/interrupt",
+            json={"session_id": "fake"},
+        )
+        _assert_traversal_rejected(response)
+
+
+class TestWorkspaceEndpointValidation:
+    """Workspace API endpoints must reject path traversal in conversation_id."""
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_browse_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.get(f"/api/v2/conversations/{payload}/workspace")
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_upload_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(f"/api/v2/conversations/{payload}/workspace/upload")
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_file_rejects_traversal(self, client: FlaskClient, payload: str):
+        # Route is /files/<path:filepath>, not /workspace/file/...
+        response = client.get(f"/api/v2/conversations/{payload}/files/test.py")
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_preview_rejects_traversal(self, client: FlaskClient, payload: str):
+        # Route is /workspace/<path:filepath>/preview
+        response = client.get(
+            f"/api/v2/conversations/{payload}/workspace/test.py/preview"
+        )
+        _assert_traversal_rejected(response)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_download_rejects_traversal(self, client: FlaskClient, payload: str):
+        # Route is /workspace/<path:filepath>/download
+        response = client.get(
+            f"/api/v2/conversations/{payload}/workspace/test.py/download"
+        )
+        _assert_traversal_rejected(response)
+
+
+class TestConversationEndpointValidation:
+    """Conversation CRUD endpoints must reject path traversal in conversation_id."""
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_post_message_rejects_traversal(self, client: FlaskClient, payload: str):
+        response = client.post(
+            f"/api/v2/conversations/{payload}",
+            json={"role": "user", "content": "test"},
+        )
+        _assert_traversal_rejected(response)
+
+
+FILE_TRAVERSAL_PAYLOADS = [
+    "/etc/passwd",
+    "../../etc/passwd",
+    "/tmp/secret",
+    "../../../root/.ssh/id_rsa",
+]
+
+
+class TestFileAttachmentPathValidation:
+    """POST /conversations/:id must reject path traversal in the files field."""
+
+    def _make_conv(self, tmp_path, monkeypatch):
+        """Create a minimal conversation and wire up get_logs_dir."""
+        from rig.logmanager import LogManager
+        from rig.message import Message
+
+        logs_dir = tmp_path / "logs"
+        conv_logdir = logs_dir / "test-conv"
+        LogManager.load(
+            logdir=conv_logdir,
+            initial_msgs=[Message("user", "hi")],
+            create=True,
+        ).write()
+
+        monkeypatch.setattr(
+            "rig.server.api_v2.get_logs_dir",
+            lambda: logs_dir,
+        )
+
+    @pytest.mark.parametrize("payload", FILE_TRAVERSAL_PAYLOADS)
+    def test_rejects_traversal_in_files(
+        self, client: FlaskClient, tmp_path, monkeypatch, payload: str
+    ):
+        self._make_conv(tmp_path, monkeypatch)
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={"role": "user", "content": "hello", "files": [payload]},
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "error" in data
+
+    def test_safe_relative_path_not_rejected_as_traversal(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """A relative path within workspace must not be rejected for traversal.
+
+        The request may still fail (file doesn't exist, etc.) but the 400
+        must not be due to the traversal guard.
+        """
+        self._make_conv(tmp_path, monkeypatch)
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={"role": "user", "content": "hello", "files": ["data.txt"]},
+        )
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data is None or "escapes workspace" not in data.get("error", "")
+            assert data is None or "Absolute file paths" not in data.get("error", "")
+
+
+class TestValidConversationIdAccepted:
+    """Valid conversation_ids must not be rejected by path traversal checks."""
+
+    def test_simple_name(self, client: FlaskClient):
+        """A valid name passes validation (may fail later with 404/etc, not 400 traversal)."""
+        response = client.get("/api/v2/conversations/valid-conv-name/workspace")
+        # Should not be rejected as traversal — the error (if any) will be
+        # about the conversation not existing, not about invalid ID
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data["error"] != "Invalid conversation_id"
+
+    def test_name_with_numbers(self, client: FlaskClient):
+        response = client.get("/api/v2/conversations/test-2026-04-03/workspace")
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data["error"] != "Invalid conversation_id"
+
+    def test_name_with_dots_no_traversal(self, client: FlaskClient):
+        """A single dot is fine (not '..')."""
+        response = client.get("/api/v2/conversations/test.conv.name/workspace")
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data["error"] != "Invalid conversation_id"
+
+
+BRANCH_TRAVERSAL_PAYLOADS = [
+    "../../../etc/passwd",
+    "..\\..\\secret",
+    "..",
+    "main/../../secret",
+]
+
+
+def _assert_branch_rejected(response):
+    """Assert the response is a 400 with the branch validation error message."""
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data["error"] == "Invalid branch name"
+
+
+class TestBranchParameterValidation:
+    """Branch parameters in request bodies must reject path traversal.
+
+    Tested via the generate endpoint (POST /conversations/:id) which reaches
+    branch validation after conversation_id validation. The step endpoint
+    requires a live session, so branch validation there is tested via the
+    unit test for _validate_branch below.
+    """
+
+    @pytest.mark.parametrize("payload", BRANCH_TRAVERSAL_PAYLOADS)
+    def test_generate_rejects_branch_traversal(self, client: FlaskClient, payload: str):
+        """POST /conversations/:id with traversal branch should be rejected."""
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={
+                "role": "user",
+                "content": "hello",
+                "branch": payload,
+            },
+        )
+        _assert_branch_rejected(response)
+
+    def test_valid_branch_accepted(self, client: FlaskClient):
+        """Valid branch names like 'main' or 'feature-1' should not be rejected."""
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={
+                "role": "user",
+                "content": "hello",
+                "branch": "main",
+            },
+        )
+        # Should not be rejected as traversal
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data["error"] != "Invalid branch name"
+
+
+class TestAvatarPathSecurity:
+    """Avatar endpoints must not serve non-image files."""
+
+    def test_user_avatar_rejects_non_image_extension(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """User avatar path pointing to a non-image file must be rejected."""
+        from unittest.mock import MagicMock
+
+        fake_key = tmp_path / "id_rsa"
+        fake_key.write_text("PRIVATE KEY")
+
+        mock_config = MagicMock()
+        mock_config.user.avatar = str(fake_key)
+
+        monkeypatch.setattr("rig.server.api_v2.load_user_config", lambda: mock_config)
+        response = client.get("/api/v2/user/avatar")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "image" in data["error"].lower()
+
+    def test_user_avatar_accepts_image_extension(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """User avatar path pointing to a valid image file must be served."""
+        from unittest.mock import MagicMock
+
+        fake_img = tmp_path / "avatar.png"
+        fake_img.write_bytes(_VALID_PNG)
+
+        mock_config = MagicMock()
+        mock_config.user.avatar = str(fake_img)
+
+        monkeypatch.setattr("rig.server.api_v2.load_user_config", lambda: mock_config)
+        response = client.get("/api/v2/user/avatar")
+        assert response.status_code == 200
+
+    def test_user_avatar_rejects_dotfile_without_image_ext(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Files like .env or .bashrc must be rejected even if they exist."""
+        from unittest.mock import MagicMock
+
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("SECRET=value")
+
+        mock_config = MagicMock()
+        mock_config.user.avatar = str(fake_env)
+
+        monkeypatch.setattr("rig.server.api_v2.load_user_config", lambda: mock_config)
+        response = client.get("/api/v2/user/avatar")
+        assert response.status_code == 400
+
+    def test_agent_avatar_by_path_rejects_non_image_extension(
+        self, client: FlaskClient, tmp_path, monkeypatch, auth_headers
+    ):
+        """Agent avatar endpoint must reject non-image files inside the workspace."""
+        from unittest.mock import MagicMock
+
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        fake_key = agent_dir / "id_rsa"
+        fake_key.write_text("PRIVATE KEY")
+
+        mock_config = MagicMock()
+        mock_config.agent.avatar = "id_rsa"
+
+        monkeypatch.setattr(
+            "rig.server.api_v2.get_project_config",
+            lambda path, quiet=True: mock_config,
+        )
+        response = client.get(
+            f"/api/v2/agents/avatar?path={agent_dir}",
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "image" in data["error"].lower()
+
+    def test_agent_avatar_by_path_accepts_image_extension(
+        self, client: FlaskClient, tmp_path, monkeypatch, auth_headers
+    ):
+        """Agent avatar endpoint should still serve valid image files."""
+        from unittest.mock import MagicMock
+
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        fake_img = agent_dir / "avatar.png"
+        fake_img.write_bytes(_VALID_PNG)
+
+        mock_config = MagicMock()
+        mock_config.agent.avatar = "avatar.png"
+
+        monkeypatch.setattr(
+            "rig.server.api_v2.get_project_config",
+            lambda path, quiet=True: mock_config,
+        )
+        response = client.get(
+            f"/api/v2/agents/avatar?path={agent_dir}",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+
+    def test_conversation_agent_avatar_rejects_non_image_extension(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Conversation agent avatar endpoint must reject non-image files."""
+        from unittest.mock import MagicMock
+
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        fake_key = agent_dir / "id_rsa"
+        fake_key.write_text("PRIVATE KEY")
+
+        mock_chat_config = MagicMock()
+        mock_chat_config.agent_config.avatar = "id_rsa"
+        mock_chat_config.agent = agent_dir
+
+        # Create the logdir and a valid conversation log so the
+        # conversation-exists guards pass and the test reaches avatar
+        # validation.
+        from rig.logmanager import LogManager
+        from rig.message import Message
+
+        logs_dir = tmp_path / "logs"
+        conv_logdir = logs_dir / "test-conv"
+        LogManager.load(
+            logdir=conv_logdir,
+            initial_msgs=[Message("user", "hi")],
+            create=True,
+        ).write()
+
+        monkeypatch.setattr(
+            "rig.server.api_v2.get_logs_dir",
+            lambda: logs_dir,
+        )
+        monkeypatch.setattr(
+            "rig.server.api_v2.ChatConfig.load_or_create",
+            lambda logdir, default: mock_chat_config,
+        )
+        response = client.get("/api/v2/conversations/test-conv/agent/avatar")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "image" in data["error"].lower()
+
+    def test_user_avatar_rejects_disguised_non_image(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """A file with an image extension but non-image content must be rejected.
+
+        Extension checks alone can be bypassed by renaming a file (e.g.
+        ``secrets.env`` → ``avatar.jpg``).  This test ensures content-based
+        validation (Pillow magic-byte detection) catches such files.
+        """
+        from unittest.mock import MagicMock
+
+        disguised = tmp_path / "avatar.jpg"
+        disguised.write_text("PRIVATE KEY MATERIAL\nnot a JPEG at all")
+
+        mock_config = MagicMock()
+        mock_config.user.avatar = str(disguised)
+
+        monkeypatch.setattr("rig.server.api_v2.load_user_config", lambda: mock_config)
+        response = client.get("/api/v2/user/avatar")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "image" in data["error"].lower()
+
+
+class TestAgentCreationPathValidation:
+    """Agent creation endpoint must reject paths outside the server working directory."""
+
+    def _put_agent(self, client: FlaskClient, path: str | None = None):
+        """Helper to send an agent creation request with optional path."""
+        payload = {
+            "name": "test-agent",
+            "template_repo": "https://github.com/rig/rig-agent-template",
+            "template_branch": "master",
+            "fork_command": "echo ok",
+        }
+        if path is not None:
+            payload["path"] = path
+        return client.put(
+            "/api/v2/agents",
+            json=payload,
+            content_type="application/json",
+        )
+
+    def test_rejects_absolute_path_outside_cwd(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Absolute paths outside server working directory must be rejected."""
+        from rig.server import api_v2_agents
+
+        monkeypatch.setattr(
+            api_v2_agents, "INITIAL_WORKING_DIRECTORY", tmp_path.resolve()
+        )
+        response = self._put_agent(client, path="/tmp/evil-agent")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["error"] == "Path must be within the server working directory"
+
+    def test_rejects_home_directory_path(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Paths under home directory but outside cwd must be rejected."""
+        from rig.server import api_v2_agents
+
+        monkeypatch.setattr(
+            api_v2_agents, "INITIAL_WORKING_DIRECTORY", tmp_path.resolve()
+        )
+        response = self._put_agent(client, path="~/sneaky-agent")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["error"] == "Path must be within the server working directory"
+
+    def test_rejects_traversal_in_path(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Path traversal via ../ must be rejected."""
+        from rig.server import api_v2_agents
+
+        monkeypatch.setattr(
+            api_v2_agents, "INITIAL_WORKING_DIRECTORY", tmp_path.resolve()
+        )
+        response = self._put_agent(client, path="../../../tmp/escape")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["error"] == "Path must be within the server working directory"
+
+    def test_rejects_etc_path(self, client: FlaskClient, tmp_path, monkeypatch):
+        """System directories must be rejected."""
+        from rig.server import api_v2_agents
+
+        monkeypatch.setattr(
+            api_v2_agents, "INITIAL_WORKING_DIRECTORY", tmp_path.resolve()
+        )
+        response = self._put_agent(client, path="/etc/rig-agent")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["error"] == "Path must be within the server working directory"
+
+    @pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
+    def test_rejects_non_object_json_body(self, client: FlaskClient, body: object):
+        """Agent creation should reject non-object JSON bodies with 400."""
+        response = client.put(
+            "/api/v2/agents",
+            json=body,
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert data["error"] == "Request body must be a JSON object"
+
+    def test_rejects_name_that_slugifies_to_empty(
+        self, client: FlaskClient, tmp_path, monkeypatch
+    ):
+        """Names that produce an empty slug must be rejected to prevent workspace-at-cwd."""
+        from rig.server import api_v2_agents
+
+        monkeypatch.setattr(
+            api_v2_agents, "INITIAL_WORKING_DIRECTORY", tmp_path.resolve()
+        )
+        # "@#$%" slugifies to "" — INITIAL_WORKING_DIRECTORY / "" == INITIAL_WORKING_DIRECTORY
+        payload = {
+            "name": "@#$%",
+            "template_repo": "https://github.com/rig/rig-agent-template",
+            "template_branch": "master",
+            "fork_command": "echo ok",
+        }
+        response = client.put(
+            "/api/v2/agents",
+            json=payload,
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert "alphanumeric" in data["error"].lower()
+
+
+class TestConversationIdLengthValidation:
+    """conversation_id values longer than NAME_MAX must return 400, not 500.
+
+    Linux filesystems (ext4, xfs) raise OSError ENAMETOOLONG for path components
+    longer than NAME_MAX (typically 255).  The server used to catch only
+    FileNotFoundError, so an over-long ID triggered an unhandled 500.
+    """
+
+    def test_too_long_id_returns_400_not_500(self, client: FlaskClient):
+        """A 256-char conversation_id must return 400, not 500 (OSError)."""
+        long_id = "a" * 256
+        response = client.get(f"/api/v2/conversations/{long_id}")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "too long" in data["error"]
+
+    def test_exactly_255_chars_is_accepted(self, client: FlaskClient):
+        """A 255-char ID is at the limit and must not be rejected by length check."""
+        ok_id = "a" * 255
+        response = client.get(f"/api/v2/conversations/{ok_id}")
+        # Must not crash (500) and must not be rejected for length
+        assert response.status_code != 500
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data is None or "too long" not in data.get("error", "")
+
+    def test_very_long_id_unit(self):
+        """Unit test: _validate_conversation_id returns error for over-limit IDs."""
+        from rig.server.api_v2_common import _validate_conversation_id
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id("a" * 256)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_255_char_id_passes_unit(self):
+        """Unit test: _validate_conversation_id accepts IDs up to 255 chars."""
+        from rig.server.api_v2_common import _validate_conversation_id
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            assert _validate_conversation_id("a" * 255) is None
+
+    def test_whitespace_only_id_rejected_unit(self):
+        """Whitespace-only conversation IDs must be rejected before hitting disk."""
+        from rig.server.api_v2_common import _validate_conversation_id
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id("   ")
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    @pytest.mark.parametrize(
+        "bad_id", [" leading", "trailing ", "foo\tbar", "foo\nbar"]
+    )
+    def test_control_or_edge_whitespace_id_rejected_unit(self, bad_id: str):
+        """Control chars and edge whitespace should fail before filesystem access."""
+        from rig.server.api_v2_common import _validate_conversation_id
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id(bad_id)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_multibyte_over_limit_rejected(self):
+        """Multi-byte chars counted by UTF-8 bytes, not code points.
+
+        255 CJK chars = 765 bytes > NAME_MAX and must be rejected even though
+        len() == 255 (code points).
+        """
+        from rig.server.api_v2_common import _validate_conversation_id
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # Each CJK char is 3 UTF-8 bytes; 85 * 3 = 255 bytes (at limit, OK)
+            assert _validate_conversation_id("あ" * 85) is None
+            # 86 * 3 = 258 bytes (over limit, must reject)
+            result = _validate_conversation_id("あ" * 86)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+
+class TestBranchLengthValidation:
+    """Branch names longer than NAME_MAX must return 400, not 500."""
+
+    def test_too_long_branch_unit(self):
+        """Unit test: _validate_branch returns error for over-limit names.
+
+        Effective limit is NAME_MAX - len(".jsonl") = 249 bytes because the
+        on-disk filename is ``{branch}.jsonl``.
+        """
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_branch("b" * 250)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_249_char_branch_passes_unit(self):
+        """Unit test: _validate_branch accepts names up to 249 bytes.
+
+        249 bytes is the effective limit: NAME_MAX (255) minus the 6-byte
+        ``.jsonl`` suffix that is appended when the branch is stored on disk.
+        """
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # 249 bytes: at the effective limit — must pass
+            assert _validate_branch("b" * 249) is None
+            # 250 bytes: one over the limit — must be rejected
+            result = _validate_branch("b" * 250)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_multibyte_branch_over_limit_rejected(self):
+        """Multi-byte branch names counted by UTF-8 bytes, not code points.
+
+        Effective limit is 249 bytes (NAME_MAX - len(".jsonl")).
+        Each CJK char is 3 UTF-8 bytes, so 83 chars = 249 bytes (OK),
+        84 chars = 252 bytes (over limit).
+        """
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # 83 CJK chars = 249 bytes (at effective limit, OK)
+            assert _validate_branch("あ" * 83) is None
+            # 84 CJK chars = 252 bytes (over effective limit, must reject)
+            result = _validate_branch("あ" * 84)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_too_long_branch_via_endpoint(self, client: FlaskClient):
+        """Over-limit branch name in generate request must return 400.
+
+        Effective limit is 249 bytes; 250 bytes must be rejected.
+        """
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={
+                "role": "user",
+                "content": "hello",
+                "branch": "b" * 250,
+            },
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "too long" in data["error"]
+
+
+class TestValidateBranchUnit:
+    """Unit tests for _validate_branch function (requires Flask app context)."""
+
+    def test_rejects_traversal_payloads(self):
+        """All traversal payloads must be rejected by _validate_branch."""
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            for payload in BRANCH_TRAVERSAL_PAYLOADS:
+                assert _validate_branch(payload) is not None, (
+                    f"Should reject: {payload}"
+                )
+
+    def test_accepts_valid_names(self):
+        """Valid branch names should pass validation."""
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            for name in ["main", "feature-1", "my_branch", "v2.0"]:
+                assert _validate_branch(name) is None, f"Should accept: {name}"
+
+    def test_rejects_null_branch(self):
+        """A null branch value must be rejected with 400, not raise TypeError (500)."""
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_branch(None)
+            assert result is not None, "Should reject None branch"
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_rejects_non_string_branch(self):
+        """Non-string branch values (int, list) must be rejected with 400."""
+        from rig.server.api_v2_common import _validate_branch
+        from rig.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            for value in [123, [], {}, True]:
+                result = _validate_branch(value)
+                assert result is not None, f"Should reject non-string: {value!r}"
+                _response, status_code = result
+                assert status_code == 400

@@ -1,0 +1,51 @@
+"""
+Sets up a KeyboardInterrupt handler to handle Ctrl-C during the chat loop.
+"""
+
+import os
+import threading
+import time
+from contextvars import ContextVar
+
+from . import console
+
+# Use ContextVar for thread/session isolation
+# In server/multi-session scenarios, each session has its own interrupt state
+_interruptible_var: ContextVar[bool] = ContextVar("interruptible", default=False)
+_last_interrupt_time_var: ContextVar[float] = ContextVar(
+    "last_interrupt_time", default=0.0
+)
+
+
+def handle_keyboard_interrupt(signum, frame):  # pragma: no cover
+    """
+    This handler allows interruption of the assistant or tool execution when in an interruptible state,
+    while still providing a safeguard against accidental exits during user input.
+    """
+    # Don't raise in non-main threads — causes "Exception ignored during
+    # thread shutdown" errors, especially on Windows where worker threads
+    # use threading-based I/O instead of select().
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    current_time = time.time()
+
+    # if testing with pytest
+    testing = bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+    if _interruptible_var.get() or testing:
+        raise KeyboardInterrupt
+
+    _last_interrupt_time_var.set(current_time)
+    console.print()
+    console.log("Interrupted. Press Ctrl-D to exit.")
+
+
+def set_interruptible():
+    """Set the interruptible flag for the current context/session."""
+    _interruptible_var.set(True)
+
+
+def clear_interruptible():
+    """Clear the interruptible flag for the current context/session."""
+    _interruptible_var.set(False)

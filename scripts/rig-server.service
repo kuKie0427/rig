@@ -1,0 +1,73 @@
+# systemd unit template for running rig-server as a persistent service.
+#
+# This is the pipx self-host counterpart to the Docker Compose setup
+# (docker-compose.yml): use it when you installed rig directly with
+#   pipx install 'rig[server]'
+# and want the server to start on boot and restart on failure, without Docker.
+#
+# Install (system-wide, runs as a dedicated user):
+#   1. sudo useradd --system --create-home --shell /usr/sbin/nologin rig
+#   2. sudo -u rig pipx install 'rig[server]'
+#        (binary lands at /home/rig/.local/bin/rig-server)
+#   3. sudo -u rig mkdir -p /home/rig/.config/rig \
+#                              /home/rig/.local/share/rig \
+#                              /home/rig/.local/state/rig
+#      # Required: ProtectHome=read-only + ReadWritePaths only bind-mounts
+#      # paths that already exist; rig creates them at import time if absent,
+#      # which fails under the sandbox before a single request is served.
+#   4. sudo install -d -m 750 -o rig -g rig /etc/rig
+#      sudo install -m 640 -o rig -g rig /dev/null /etc/rig/server.env
+#      # then edit /etc/rig/server.env (see the EnvironmentFile keys below)
+#   5. sudo cp scripts/rig-server.service /etc/systemd/system/
+#      # adjust User=, the ExecStart path, and --cors-origin to match your setup
+#   6. sudo systemctl daemon-reload && sudo systemctl enable --now rig-server
+#
+# The server binds to loopback (127.0.0.1) by design: terminate TLS and expose
+# it with a reverse proxy (see the "Production Deployment" section of
+# docs/server.rst). On loopback, rig-server does not require an auth token;
+# set RIG_SERVER_TOKEN in the EnvironmentFile if you bind a public interface.
+#
+# Inspect logs with:  journalctl -u rig-server -f
+
+[Unit]
+Description=rig-server (rig web/REST API)
+Documentation=https://rig.org/docs/server.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rig
+Group=rig
+
+# Provider keys (OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY) and an
+# optional RIG_SERVER_TOKEN live here, one KEY=value per line. Keep it 0640
+# and owned by the service user so secrets are not world-readable.
+EnvironmentFile=-/etc/rig/server.env
+
+# Adjust the path to wherever pipx installed the entrypoint for User= above.
+# Bind loopback and front it with a reverse proxy; set --cors-origin to the
+# origin your web UI is served from (the hosted UI is https://chat.rig.org).
+ExecStart=/home/rig/.local/bin/rig-server serve \
+    --host 127.0.0.1 --port 5700 \
+    --cors-origin https://chat.rig.org
+
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening (loosen only if your setup needs it) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# rig persists config and conversation logs under the service user's home;
+# grant write access to just those paths (matches the User= home above).
+ReadWritePaths=/home/rig/.config/rig /home/rig/.local/share/rig /home/rig/.local/state/rig
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

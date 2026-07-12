@@ -1,0 +1,9 @@
+files = [
+    "README.md",
+    "package.json",
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/types/*.ts",
+    #"../rig/rig/server/api.py",
+    #"../rig/rig/server/workspace*.py"
+]

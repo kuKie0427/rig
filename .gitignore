@@ -1,0 +1,81 @@
+# venvs
+venv
+.venv
+
+projects
+demos
+eval[_-]results*
+
+# `tree --gitignore` wont handle the [_-] above
+eval-results*
+eval_results*
+
+# git worktrees
+dev/
+worktree/
+worktrees/
+
+# logs
+*.log
+*logs/
+logs*
+
+# fetched by make
+
+
+# media files need to be force-fully added to not pollute the repo
+media/
+
+# build/test/prof/cache
+build
+dist
+prof
+tests/output
+docs/_build
+# exclude tagged versions
+docs/releases/v*-*.md
+.coverage*
+coverage.xml
+htmlcov
+.mypy_coverage_report
+junit.xml
+__pycache__
+.*cache
+.cursor
+
+# secrets
+.env*
+*.env
+
+# filetypes
+*.csv
+*.jsonl
+*.gif
+*.cast
+*.png
+*.tmp
+.aider*
+.clean
+
+
+# if you choose to keep ~/.config/rig/config.toml in the repo
+config.toml
+
+# MacOS
+.DS_Store
+
+# VSCode
+.vscode
+profiles/
+uv.lock
+
+# Bundled webui build artifact (populated by `make bundle-webui` / CI release)
+rig/server/webui-dist/
+
+# Cache files written by scripts/build_changelog.py at build time
+scripts/changelog_contributors.csv
+scripts/changelog_contributors_twitter.csv
+
+# Keep the compose example env template tracked
+!.env.example
+state/

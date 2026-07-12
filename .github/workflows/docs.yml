@@ -1,0 +1,92 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install poetry
+        run: |
+          pipx install poetry
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+
+      - name: Install apt/dpkg dependencies
+        run: |
+          sudo apt-get install -y cloc hyperfine
+          # pandoc in ubuntu repos is from 2018...
+          wget https://github.com/jgm/pandoc/releases/download/3.3/pandoc-3.3-1-amd64.deb
+          sudo dpkg -i pandoc-3.3-1-amd64.deb
+
+      - name: Write dummy rig config
+        run: |
+          mkdir -p ~/.config/rig
+          echo -e '[prompt]\nabout_user = "testing"\nresponse_preference = "just testing"\n\n[env]\nOPENAI_API_KEY="sk-dummy-key"' > ~/.config/rig/config.toml
+
+      - name: Install dependencies
+        run: |
+          poetry install -E browser -E server
+
+      - name: Fetch eval results for leaderboard
+        run: |
+          # Fetch eval results from the dedicated eval-results branch
+          # so the docs build can generate the model leaderboard table
+          git fetch origin eval-results --depth=1 || true
+          git checkout origin/eval-results -- eval_results/ || echo "No eval results available"
+
+      - name: Build docs
+        run: make docs
+
+      - name: Build site
+        run: make site
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: site-dist
+          path: ./site/dist
+
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/master'
+    concurrency:
+      group: docs-deploy-gh-pages
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: site-dist
+          path: ./site/dist
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          publish_dir: ./site/dist
+          publish_branch: gh-pages

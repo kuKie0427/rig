@@ -1,0 +1,400 @@
+name: Release
+
+# Unified release pipeline for rig.
+#
+# Triggers:
+#   - schedule        — automated dev pre-releases (Mon + Thu at noon UTC)
+#   - workflow_dispatch — manual dev/patch/minor releases from GitHub UI
+#   - release: created — manual releases via `make release-*` (user credentials)
+#
+# For schedule/dispatch: runs preflight checks, bumps version, generates
+# changelog, creates GH release, then publishes packages and triggers builds.
+#
+# For release:created: skips preparation (already done by `make release-*`)
+# and goes straight to publishing packages and triggering builds.
+#
+# Scripts shared with `make release` / `make release-dev`:
+#   - scripts/bump_version.sh    — version bump, commit, tag
+#   - scripts/publish_release.sh — push, GH release
+#
+# Step ordering: PyPI publish is last because it's non-idempotent (rejects
+# duplicates). All steps before it are safe to re-run.
+
+on:
+  schedule:
+    # Twice weekly: Monday and Thursday at 12:00 UTC
+    - cron: '0 12 * * 1,4'
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev      # Development pre-release (.devYYYYMMDD)
+          - patch    # Stable patch release (x.y.Z+1)
+          - minor    # Stable minor release (x.Y+1.0)
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ── Preflight ─────────────────────────────────────────────────────────
+  # Only for schedule/dispatch. Checks for new commits and green CI.
+  check:
+    name: Pre-flight checks
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes and CI status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Find last stable release tag (no pre-release suffix)
+          LAST_STABLE=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          # Find last tag of any kind (including dev tags on detached commits).
+          # NOTE: `git describe --tags` only finds tags reachable from HEAD, but dev
+          # release tags live on version-bump commits that aren't pushed to master.
+          LAST_TAG=$(git tag --sort=-version:refname | head -1 || echo "")
+
+          COMMITS_SINCE_TAG=0
+          if [ -n "$LAST_TAG" ]; then
+            # Use merge-base to handle dev tags on detached commits correctly.
+            # For dev tags (one commit off master), this finds the master commit
+            # they branched from. For stable tags (on master), it's the tag itself.
+            BASE=$(git merge-base "${LAST_TAG}" HEAD 2>/dev/null || echo "")
+            if [ -n "$BASE" ]; then
+              COMMITS_SINCE_TAG=$(git rev-list "${BASE}..HEAD" --count)
+            else
+              echo "WARNING: could not find merge-base for ${LAST_TAG} — commit count unavailable, treating as 0."
+            fi
+          fi
+
+          echo "last_stable=$LAST_STABLE" >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+          echo "commits=$COMMITS_SINCE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Last stable: $LAST_STABLE | Last tag: $LAST_TAG | Commits since tag: $COMMITS_SINCE_TAG"
+
+          # Skip if no new commits
+          if [ "$COMMITS_SINCE_TAG" -eq 0 ]; then
+            echo "No new commits since $LAST_TAG — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Verify CI is green on HEAD
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "Checking CI status for $HEAD_SHA..."
+
+          # Check individual check runs (not suites) to avoid blocking on
+          # flaky/optional checks like external API tests.
+          # Exclude: API tests (external, flaky), and this workflow's own runs.
+          CONCLUSIONS=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --paginate \
+            --jq '[.check_runs[] | select(
+              .app.slug == "github-actions" and
+              (.name | test("API tests|^Pre-flight checks$|^Create release$|^Publish release$") | not)
+            )] | map(.conclusion) | unique | .[]' 2>/dev/null || echo "unknown")
+
+          echo "CI conclusions (excluding API tests): $CONCLUSIONS"
+
+          # If any required check has failed, skip
+          if echo "$CONCLUSIONS" | grep -qE "failure|action_required|timed_out"; then
+            echo "CI has failures on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "$CONCLUSIONS" | grep -qE "null|pending"; then
+            echo "CI is still running on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Require explicit success — skip if unknown or empty (API failure)
+          if [ -z "$CONCLUSIONS" ] || [ "$CONCLUSIONS" = "unknown" ]; then
+            echo "CI status unavailable on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! echo "$CONCLUSIONS" | grep -q "success"; then
+            echo "No successful CI checks found on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  # ── Prepare ───────────────────────────────────────────────────────────
+  # Only for schedule/dispatch. Bumps version, generates changelog, creates
+  # the GitHub release via publish_release.sh.
+  #
+  # Uses the `release` environment's SSH_PRIVATE_KEY (a read-write deploy
+  # key) for git pushes, so the version-bump commit and tag can bypass the
+  # branch ruleset that blocks direct pushes to master (deploy keys are a
+  # bypass actor on the ruleset; GITHUB_TOKEN is not). Note: unlike
+  # GITHUB_TOKEN pushes, deploy-key pushes trigger `push` workflows, so CI
+  # runs on the version-bump commit.
+  prepare:
+    name: Create release
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+          # Clone over SSH and persist the deploy key so the pushes in
+          # publish_release.sh (branch + tag) authenticate with it.
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Bump version
+        id: version
+        env:
+          TYPE: ${{ github.event.inputs.release_type || 'dev' }}
+        run: bash scripts/bump_version.sh --type "$TYPE"
+
+      - name: Generate changelog
+        run: |
+          # build_changelog.py is vendored in scripts/ (no longer downloaded from external URL)
+          pip install -q requests
+
+          TAG="${{ steps.version.outputs.tag }}"
+          PRERELEASE="${{ steps.version.outputs.prerelease }}"
+
+          # Use appropriate range: dev→since last tag, stable→since last stable
+          if [ "$PRERELEASE" = "true" ]; then
+            SINCE="${{ steps.version.outputs.last_tag }}"
+          else
+            SINCE="${{ steps.version.outputs.last_stable }}"
+          fi
+
+          echo "Generating changelog: ${SINCE}...${TAG}"
+          if [ "$PRERELEASE" = "true" ]; then
+            # Dev releases only get a GitHub release body. No version header —
+            # the release title already shows the version.
+            python3 scripts/build_changelog.py \
+              --range "${SINCE}...${TAG}" \
+              --project-title rig \
+              --org rig \
+              --repo rig \
+              --output /tmp/changelog.md \
+              --demote-headings
+          else
+            # Stable releases: generate the docs page (version header as page
+            # title), commit it into the version-bump commit (mirrors what
+            # `make release` does), and derive the GitHub release body from it
+            # by stripping the header.
+            python3 scripts/build_changelog.py \
+              --range "${SINCE}...${TAG}" \
+              --project-title rig \
+              --org rig \
+              --repo rig \
+              --output "docs/releases/${TAG}.md" \
+              --add-version-header
+
+            # Insert new version at top of changelog toctree (same as `make release`)
+            grep -q "releases/${TAG}.md" docs/changelog.rst || {
+              awk '/^   releases\// && !done { \
+                print "   releases/'"${TAG}"'.md"; \
+                done=1; \
+              } \
+              {print}' docs/changelog.rst > docs/changelog.rst.tmp
+              mv docs/changelog.rst.tmp docs/changelog.rst
+            }
+            # Verify the insertion actually happened (awk inserts nothing if no
+            # 'releases/' entry exists to anchor on)
+            grep -q "releases/${TAG}.md" docs/changelog.rst || {
+              echo "::error::Failed to insert releases/${TAG}.md into docs/changelog.rst toctree"
+              exit 1
+            }
+
+            git add docs/changelog.rst "docs/releases/${TAG}.md"
+            git commit --amend --no-edit
+            git tag -f "${TAG}"
+
+            tail -n +3 "docs/releases/${TAG}.md" > /tmp/changelog.md
+          fi
+
+          echo "--- Generated changelog preview ---"
+          head -50 /tmp/changelog.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/publish_release.sh --notes-file /tmp/changelog.md
+
+  # ── Publish ───────────────────────────────────────────────────────────
+  # Runs for ALL triggers:
+  #   - schedule/dispatch: after prepare creates the GH release
+  #   - release:created: directly (make release-* already created the release)
+  #
+  # Builds Python packages, uploads to GH release, triggers artifact builds,
+  # and publishes to PyPI (last, since it's non-idempotent).
+  publish:
+    name: Publish release
+    needs: [prepare]
+    # Run if: prepare succeeded (schedule/dispatch), OR release:created (manual)
+    if: >-
+      !cancelled() &&
+      (needs.prepare.result == 'success' || github.event_name == 'release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      id-token: write  # Required for Trusted Publisher (OIDC) PyPI publishing
+    env:
+      TAG: ${{ needs.prepare.outputs.tag || github.event.release.tag_name || github.ref_name }}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ env.TAG }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Build and bundle webui
+      run: |
+        cd webui && npm ci && npm run build
+        cd ..
+        make bundle-webui
+
+    - name: Build Python packages
+      run: |
+        rm -f dist/*.whl dist/*.tar.gz
+        poetry build
+
+    - name: Validate package (dry-run publish)
+      run: |
+        # Dry-run validates artifact structure and metadata — no upload, no auth check
+        poetry publish --dry-run --no-interaction
+
+    - name: Publish to PyPI
+      env:
+        POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
+      run: poetry publish
+
+    - name: Build rig-acp shim
+      continue-on-error: true
+      run: |
+        pip install build
+        cd packages/rig-acp
+        python -m build
+
+    - name: Publish rig-acp shim to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: packages/rig-acp/dist/
+        # Uses OIDC Trusted Publisher — no token needed.
+        # Requires a pending trusted publisher configured at:
+        #   https://pypi.org/manage/account/publishing/
+        # with: owner=rig, repo=rig, workflow=release.yml
+
+    - name: Upload packages to GitHub release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Wait for release to be visible (handles propagation delay for release:created)
+        for i in 1 2 3 4 5; do
+          gh release view "$TAG" &>/dev/null && break
+          echo "Waiting for release $TAG to become visible... ($i/5)"
+          sleep 5
+        done
+        gh release upload "$TAG" dist/*.whl dist/*.tar.gz --clobber
+        # Upload shim artifacts if the shim was built successfully
+        if ls packages/rig-acp/dist/*.whl 2>/dev/null; then
+          gh release upload "$TAG" packages/rig-acp/dist/*.whl packages/rig-acp/dist/*.tar.gz --clobber
+        fi
+
+    - name: Trigger artifact builds
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Verify a workflow_dispatch run actually registered after triggering.
+        # `gh workflow run` is fire-and-forget and exits 0 even when the run
+        # never starts (e.g. workflow file syntax error on the target branch,
+        # missing workflow_dispatch trigger). Without this check a release can
+        # silently ship the PyPI package with no binaries/installers built.
+        # Returns 0 if any workflow_dispatch run created at or after
+        # TRIGGER_TIME registers within ~30s, else 1. Including recently-
+        # completed runs avoids a misleading "no run registered" error when
+        # the triggered workflow starts and fast-fails before the first poll.
+        verify_triggered() {
+          local workflow="$1"
+          echo "Verifying ${workflow} run started..."
+          for i in 1 2 3 4 5 6; do
+            count="$(gh run list --workflow="${workflow}" --event=workflow_dispatch \
+              --limit 5 --json status,createdAt | \
+              jq --arg since "${TRIGGER_TIME}" \
+              '[.[] | select(.status != "completed" or .createdAt >= $since)] | length')"
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "✓ ${workflow} run registered (attempt ${i}/6)"
+              return 0
+            fi
+            # Don't sleep after the final attempt — nothing follows it.
+            if [ "${i}" -lt 6 ]; then
+              echo "Waiting for ${workflow} run to register... (${i}/6)"
+              sleep 5
+            fi
+          done
+          echo "::error::${workflow} was triggered but no active run registered within ~30s"
+          return 1
+        }
+
+        # Capture time before dispatching so verify_triggered can distinguish
+        # runs created by this dispatch from pre-existing completed runs.
+        TRIGGER_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        echo "Triggering Build workflow for ${TAG}..."
+        gh workflow run build.yml -f tag="${TAG}"
+        echo "Triggering Tauri workflow for ${TAG}..."
+        gh workflow run tauri.yml -f tag="${TAG}"
+
+        # Check both even if the first fails, so the job reports every missing
+        # trigger in one run (set -eo pipefail would otherwise stop at the first).
+        rc=0
+        verify_triggered build.yml || rc=1
+        verify_triggered tauri.yml || rc=1
+        exit "${rc}"

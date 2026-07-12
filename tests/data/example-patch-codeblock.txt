@@ -1,0 +1,29 @@
+Here's the patch:
+
+```patch knowledge/meta/lessons-draft/tools/prefer-git-grep-over-raw-grep.md
+<<<<<<< ORIGINAL
+## Recommended Pattern
+Do use search.sh or git grep.
+```text
+# Respects .gitignore automatically
+git grep "def compose" -- '*.py'
+
+# Or use the workspace search wrapper
+./scripts/search.sh "def compose"
+```
+=======
+## Recommended Pattern
+Do use search.sh or git grep.
+```text
+# List files containing pattern (faster, no content shown)
+git grep -l "def compose" -- '*.py'
+# or: git grep --files-with-matches "def compose"
+
+# Show matching lines (respects .gitignore)
+git grep "def compose" -- '*.py'
+
+# Or use the workspace search wrapper
+./scripts/search.sh "def compose"
+```
+>>>>>>> UPDATED
+```

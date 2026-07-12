@@ -1,0 +1,218 @@
+"""Tests for the models-related rig-util CLI commands."""
+
+import json
+import types
+from unittest.mock import Mock, patch
+
+from click.testing import CliRunner
+
+from rig.cli.util import main
+
+
+class TestModelsTest:
+    """Tests for 'models test' command."""
+
+    def test_help(self):
+        """Test that help text is shown."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["models", "test", "--help"])
+        assert result.exit_code == 0
+        assert "Test connectivity to a model" in result.output
+        assert "MODEL_NAME" in result.output
+
+    def test_unknown_model(self):
+        """Test error on unrecognized model/provider."""
+        with patch(
+            "rig.llm.get_provider_from_model",
+            side_effect=ValueError("Unknown provider: fake"),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["models", "test", "fake/model"])
+        assert result.exit_code == 1
+        assert "Unknown model or provider" in result.output
+        assert "rig-util models list" in result.output
+
+    def test_missing_api_key(self):
+        """Test error when API key is not configured."""
+        mock_config = Mock()
+        mock_config.get_env.return_value = None
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["models", "test", "anthropic/claude-haiku-4-5"]
+            )
+        assert result.exit_code == 1
+        assert "ANTHROPIC_API_KEY" in result.output
+        assert "not set" in result.output or "not configured" in result.output
+
+    def test_missing_api_key_json(self):
+        """Test --json output when API key is missing."""
+        mock_config = Mock()
+        mock_config.get_env.return_value = None
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["models", "test", "anthropic/claude-haiku-4-5", "--json"]
+            )
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["success"] is False
+        assert "ANTHROPIC_API_KEY" in data["error"]
+
+    def test_successful_call(self):
+        """Test successful model test call."""
+        mock_config = Mock()
+        mock_config.get_env.return_value = "sk-ant-test-key"
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+            patch("rig.llm.init_llm"),
+            patch(
+                "rig.llm._chat_complete",
+                return_value=("OK", {"model": "claude-haiku-4-5"}),
+            ) as mock_complete,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["models", "test", "anthropic/claude-haiku-4-5"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "✅" in result.output
+        assert "working correctly" in result.output
+        call_args = mock_complete.call_args
+        messages = call_args[0][0]
+        assert messages[0].role == "system"
+        assert messages[1].role == "user"
+        assert call_args[1]["max_tokens"] == 5
+
+    def test_successful_call_json(self):
+        """Test --json output on successful call."""
+        mock_config = Mock()
+        mock_config.get_env.return_value = "sk-ant-test-key"
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+            patch("rig.llm.init_llm"),
+            patch("rig.llm._chat_complete", return_value=("OK", {})),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["models", "test", "anthropic/claude-haiku-4-5", "--json"]
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["success"] is True
+        assert data["model"] == "anthropic/claude-haiku-4-5"
+        assert data["provider"] == "anthropic"
+        assert "latency_ms" in data
+        assert data["response"] == "OK"
+
+    def test_api_failure(self):
+        """Test error output when API call fails."""
+        mock_config = Mock()
+        mock_config.get_env.return_value = "sk-ant-expired"
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+            patch("rig.llm.init_llm"),
+            patch(
+                "rig.llm._chat_complete",
+                side_effect=Exception("Error code: 401 - Unauthorized"),
+            ),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["models", "test", "anthropic/claude-haiku-4-5"]
+            )
+        assert result.exit_code == 1
+        assert "Request failed" in result.output
+        assert "Common causes" in result.output
+
+    def test_bare_provider_resolves_default(self):
+        """Test that a bare provider name resolves to a default model."""
+        mock_config = Mock()
+        mock_config.get_env.side_effect = lambda k: (
+            "sk-test" if k == "ANTHROPIC_API_KEY" else None
+        )
+        with (
+            patch("rig.llm.get_provider_from_model", return_value="anthropic"),
+            patch("rig.cli.util.get_config", return_value=mock_config),
+            patch("rig.llm.init_llm"),
+            patch("rig.llm._chat_complete", return_value=("OK", {})),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["models", "test", "anthropic"])
+        assert result.exit_code == 0, result.output
+        assert "Using default model for anthropic" in result.output
+        assert "claude-haiku-4-5" in result.output
+
+    def test_bare_provider_no_default(self):
+        """Test that providers without a default model (e.g. azure) give a clear error."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["models", "test", "azure"])
+        assert result.exit_code == 1
+        assert "No default model for 'azure'" in result.output
+        assert (
+            "azure/my-deployment" in result.output or "full model name" in result.output
+        )
+
+
+class TestModelsInfo:
+    """Tests for 'models info' command."""
+
+    def test_help(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["models", "info", "--help"])
+        assert result.exit_code == 0
+        assert "detailed information about a specific model" in result.output
+
+    @staticmethod
+    def _run_models_info(*args: str):
+        """Invoke 'rig-util models info' via CliRunner for separate stdout/stderr capture.
+
+        Uses r.stdout and r.stderr (available since click 8.2) so stdout and stderr are
+        independently accessible without spawning a subprocess (which is slow on CI and
+        can hit pytest timeouts).
+        """
+        runner = CliRunner()
+        r = runner.invoke(main, ["models", "info", *args])
+        result = types.SimpleNamespace(
+            returncode=r.exit_code,
+            stdout=r.stdout,
+            stderr=r.stderr or "",
+        )
+        return result
+
+    def test_known_model_no_warning(self):
+        """A recognized provider/model shows info with no fallback warning."""
+        result = self._run_models_info("anthropic/claude-opus-4-7")
+        assert result.returncode == 0, result.stderr
+        assert "Provider: anthropic" in result.stdout
+        assert "Unrecognized provider" not in result.stderr
+
+    def test_unknown_provider_warns_on_stderr(self):
+        """An unrecognized provider prefix still shows fallback metadata, but
+        warns on stderr so the user knows the values are generic."""
+        result = self._run_models_info("bogus/model")
+        # Lenient behaviour preserved: still exits 0 with fallback metadata.
+        assert result.returncode == 0, result.stderr
+        assert "Model: bogus/model" in result.stdout
+        # Warning lands on stderr (so it never corrupts piped stdout).
+        assert "Unrecognized provider" in result.stderr
+
+    def test_unknown_provider_json_stays_clean(self):
+        """With --json, the warning goes to stderr, keeping stdout JSON clean."""
+        result = self._run_models_info("bogus/model", "--json")
+        assert result.returncode == 0, result.stderr
+        # Warning is isolated to stderr.
+        assert "Unrecognized provider" in result.stderr
+        # stdout is valid JSON and contains the expected model field.
+        data = json.loads(result.stdout)
+        assert data["model"] == "bogus/model"

@@ -1,0 +1,1849 @@
+import json
+import os
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+import tomlkit
+
+from rig.config import (
+    ChatConfig,
+    Config,
+    MCPConfig,
+    ProjectConfig,
+    UserIdentityConfig,
+    get_config,
+    load_user_config,
+    setup_config_from_cli,
+)
+from rig.config.user import (
+    USER_CONFIG_SOURCE_ENV,
+    USER_CONFIG_SOURCE_LOCAL,
+    USER_CONFIG_SOURCE_MAIN,
+    get_user_config_env_source,
+    get_user_config_runtime_info,
+)
+
+default_user_config = """[prompt]
+about_user = "I am a curious human programmer."
+response_preference = "Don't explain basic concepts"
+
+[env]
+"""
+
+default_mcp_config = """
+[mcp]
+enabled = true
+auto_start = true
+"""
+
+test_mcp_server_1_enabled = """
+[[mcp.servers]]
+name = "my-server"
+enabled = true
+command = "server-command"
+args = ["--arg1", "--arg2"]
+env = { API_KEY = "your-key" }
+"""
+
+test_mcp_server_1_disabled = """
+[[mcp.servers]]
+name = "my-server"
+enabled = false
+"""
+
+test_mcp_server_2_enabled = """
+[[mcp.servers]]
+name = "my-server-2"
+enabled = true
+command = "server-command-2"
+args = ["--arg2", "--arg3"]
+env = { API_KEY = "your-key-2" }
+"""
+
+test_mcp_server_2_disabled = """
+[[mcp.servers]]
+name = "my-server-2"
+enabled = false
+"""
+
+test_mcp_server_3 = """
+[[mcp.servers]]
+name = "my-server-3"
+enabled = true
+command = "server-command-3"
+args = ["--arg3", "--arg4"]
+env = { API_KEY = "your-key-3" }
+"""
+
+test_mcp_server_4 = """
+[[mcp.servers]]
+name = "my-server-4"
+enabled = true
+command = "server-command-4"
+args = ["--arg4", "--arg5"]
+env = { API_KEY = "your-key-4" }
+"""
+
+chat_config_toml = """
+[chat]
+model = "gpt-4o"
+tools = ["tool1", "tool2"]
+tool_format = "markdown"
+stream = true
+interactive = true
+workspace = "~/workspace"
+
+[env]
+API_KEY = "your-key"
+
+[mcp]
+enabled = true
+auto_start = true
+
+[[mcp.servers]]
+name = "my-server"
+enabled = true
+command = "server-command"
+args = ["--arg1", "--arg2"]
+env = { API_KEY = "your-key" }
+"""
+
+config_mcp_json = """{
+    "enabled": true,
+    "auto_start": true,
+    "servers": [
+        {
+            "name": "my-server",
+            "enabled": true,
+            "command": "server-command",
+            "args": ["--arg1", "--arg2"],
+            "env": {
+                "API_KEY": "your-key"
+            }
+        }
+    ]
+}"""
+
+
+config_json = (
+    """
+{
+    "chat": {
+        "model": "gpt-4o",
+        "tools": ["tool1", "tool2"],
+        "tool_format": "markdown",
+        "stream": true,
+        "interactive": true,
+        "workspace": "~/workspace"
+    },
+    "env": {
+        "API_KEY": "your-key"
+    },
+    "mcp": """
+    + config_mcp_json
+    + """
+}
+"""
+)
+
+project_config_toml = """
+files = [
+  "README.md",
+  "ARCHITECTURE.md",
+  "rig.toml"
+]
+context_cmd = "scripts/context.sh"
+prompt = "You are a helpful assistant."
+base_prompt = "My custom base prompt."
+
+[mcp]
+enabled = true
+auto_start = true
+
+[[mcp.servers]]
+name = "sqlite"
+enabled = true
+command = "uvx"
+args = [
+    "mcp-server-sqlite",
+    "--db-path",
+    "database.db"
+]
+
+[[mcp.servers]]
+name = "oura"
+enabled = true
+command = "uvx"
+args = ["oura-mcp-server"]
+
+[rag]
+enabled = true
+
+[agent]
+name = "TestBot"
+avatar = "assets/avatar.png"
+
+[agent.urls]
+dashboard = "https://testbot.example.com/dashboard/"
+repo = "https://github.com/testorg/testbot"
+
+"""
+
+project_config_json = """
+{
+    "files": ["README.md", "ARCHITECTURE.md", "rig.toml"],
+    "context_cmd": "scripts/context.sh",
+    "prompt": "You are a helpful assistant.",
+    "base_prompt": "My custom base prompt.",
+    "rag": {
+        "enabled": true
+    },
+    "mcp": {
+        "enabled": true,
+        "auto_start": true,
+        "servers": [
+            {
+                "name": "sqlite",
+                "enabled": true,
+                "command": "uvx",
+                "args": ["mcp-server-sqlite", "--db-path", "database.db"]
+            },
+            {
+                "name": "oura",
+                "enabled": true,
+                "command": "uvx",
+                "args": ["oura-mcp-server"]
+            }
+        ]
+    },
+    "agent": {
+        "name": "TestBot",
+        "avatar": "assets/avatar.png",
+        "urls": {
+            "dashboard": "https://testbot.example.com/dashboard/",
+            "repo": "https://github.com/testorg/testbot"
+        }
+    }
+}
+"""
+
+
+def test_get_config():
+    config = get_config()
+    assert config
+
+
+def test_project_config_exclude_field():
+    """Test that [prompt] exclude list is parsed correctly from rig.toml."""
+    import tomlkit
+
+    toml_str = """
+[prompt]
+files = ["README.md", "*.lock"]
+exclude = ["*.lock", "*.jsonl"]
+"""
+    config_data = dict(tomlkit.loads(toml_str))
+    project_config = ProjectConfig.from_dict(config_data)
+    assert project_config.files == ["README.md", "*.lock"]
+    assert project_config.exclude == ["*.lock", "*.jsonl"]
+
+
+def test_project_config_exclude_field_default():
+    """Test that [prompt] exclude defaults to an empty list."""
+    import tomlkit
+
+    toml_str = """
+[prompt]
+files = ["README.md"]
+"""
+    config_data = dict(tomlkit.loads(toml_str))
+    project_config = ProjectConfig.from_dict(config_data)
+    assert project_config.exclude == []
+
+
+def test_project_config_system_field():
+    """Test that [prompt] system is parsed and defaults to None."""
+    import tomlkit
+
+    toml_str = """
+[prompt]
+system = "short"
+files = ["README.md"]
+"""
+    config_data = dict(tomlkit.loads(toml_str))
+    project_config = ProjectConfig.from_dict(config_data)
+    assert project_config.system == "short"
+    assert project_config.files == ["README.md"]
+
+
+def test_project_config_system_field_default():
+    """Test that [prompt] system defaults to None when not set."""
+    import tomlkit
+
+    toml_str = """
+[prompt]
+files = ["README.md"]
+"""
+    config_data = dict(tomlkit.loads(toml_str))
+    project_config = ProjectConfig.from_dict(config_data)
+    assert project_config.system is None
+
+
+def test_project_config_system_field_rejects_invalid_value():
+    """Test that [prompt] system rejects typos instead of treating them as custom prompts."""
+    import tomlkit
+
+    toml_str = """
+[prompt]
+system = "typo"
+"""
+    config_data = dict(tomlkit.loads(toml_str))
+    with pytest.raises(ValueError, match="prompt.system must be one of: full, short"):
+        ProjectConfig.from_dict(config_data)
+
+
+def test_env_vars_loaded_in_correct_priority(monkeypatch, tmp_path):
+    temp_user_config = str(tmp_path / "config.toml")
+    temp_project_config = str(tmp_path / "rig.toml")
+
+    # Create a temporary user config file with env vars and check that they are loaded
+    with open(temp_user_config, "w") as temp_file:
+        temp_file.write(default_user_config)
+        temp_file.write('TEST_KEY = "file_test_key"\nANOTHER_KEY = "file_value"')
+        temp_file.flush()
+    config = Config(user=load_user_config(temp_user_config))
+    assert config.get_env("TEST_KEY") == "file_test_key"
+    assert config.get_env("ANOTHER_KEY") == "file_value"
+
+    # Check that the env vars are overridden by the project config
+    project_config = (
+        """[env]\nTEST_KEY = \"project_test_key\"\nANOTHER_KEY = \"project_value\""""
+    )
+    with open(temp_project_config, "w") as temp_file:
+        temp_file.write(project_config)
+        temp_file.flush()
+    config = Config.from_workspace(tmp_path)
+    config = replace(config, user=load_user_config(temp_user_config))
+    assert config.get_env("TEST_KEY") == "project_test_key"
+    assert config.get_env("ANOTHER_KEY") == "project_value"
+
+    # Check that the env vars are overridden by the environment
+    monkeypatch.setenv("ANOTHER_KEY", "env_value")
+    monkeypatch.setenv("TEST_KEY", "env_test_key")
+    assert config.get_env("TEST_KEY") == "env_test_key"
+    assert config.get_env("ANOTHER_KEY") == "env_value"
+
+
+def test_mcp_config_loaded_in_correct_priority(tmp_path):
+    temp_user_config = str(tmp_path / "config.toml")
+    temp_project_config = str(tmp_path / "rig.toml")
+
+    # Create a temporary user config file with MCP config
+    with open(temp_user_config, "w") as temp_file:
+        temp_file.write(default_user_config)
+        temp_file.write("\n" + default_mcp_config)
+        temp_file.write("\n" + test_mcp_server_1_enabled)
+        temp_file.write("\n" + test_mcp_server_2_enabled)
+        temp_file.flush()
+    config = Config(user=load_user_config(temp_user_config))
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+    assert len(config.mcp.servers) == 2
+    my_server = next(s for s in config.mcp.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is True
+    assert my_server.command == "server-command"
+    assert my_server.args == ["--arg1", "--arg2"]
+    assert my_server.env == {"API_KEY": "your-key"}
+    my_server_2 = next(s for s in config.mcp.servers if s.name == "my-server-2")
+    assert my_server_2.name == "my-server-2"
+    assert my_server_2.enabled is True
+    assert my_server_2.command == "server-command-2"
+    assert my_server_2.args == ["--arg2", "--arg3"]
+    assert my_server_2.env == {"API_KEY": "your-key-2"}
+
+    # Check that the MCP config is overridden by the project config
+    project_config = """[mcp]\nenabled = false\nauto_start = false"""
+    with open(temp_project_config, "w") as temp_file:
+        temp_file.write(project_config)
+        temp_file.write("\n" + test_mcp_server_1_disabled)
+        temp_file.write("\n" + test_mcp_server_3)
+        temp_file.flush()
+    config = Config.from_workspace(tmp_path)
+    config = replace(config, user=load_user_config(temp_user_config))
+
+    # Check that the MCP config is overridden by the project config
+    assert config.mcp.enabled is False
+    assert config.mcp.auto_start is False
+
+    # Check that the MCP servers are merged from the user and project configs
+    # Should have 3 servers:
+    # - my-server (enabled in user config, disabled in project config)
+    # - my-server-2 (added in user config, not in project config)
+    # - my-server-3 (added in project config, not in user config)
+    assert len(config.mcp.servers) == 3
+    my_server = next(s for s in config.mcp.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is False
+    my_server_2 = next(s for s in config.mcp.servers if s.name == "my-server-2")
+    assert my_server_2.name == "my-server-2"
+    assert my_server_2.enabled is True
+    assert my_server_2.command == "server-command-2"
+    assert my_server_2.args == ["--arg2", "--arg3"]
+    assert my_server_2.env == {"API_KEY": "your-key-2"}
+    my_server_3 = next(s for s in config.mcp.servers if s.name == "my-server-3")
+    assert my_server_3.name == "my-server-3"
+    assert my_server_3.enabled is True
+    assert my_server_3.command == "server-command-3"
+    assert my_server_3.args == ["--arg3", "--arg4"]
+    assert my_server_3.env == {"API_KEY": "your-key-3"}
+
+    # Load chat config
+    chat_config_toml_str = """
+        [chat]
+        model = "gpt-4o"
+        tools = ["tool1", "tool2"]
+        tool_format = "markdown"
+        stream = true
+        interactive = true
+
+        [mcp]
+        enabled = true
+        auto_start = true
+
+    """
+    chat_config_toml_str += test_mcp_server_2_disabled + "\n\n" + test_mcp_server_4
+    chat_config_dict = tomlkit.loads(chat_config_toml_str)
+    chat_config = ChatConfig.from_dict(chat_config_dict.unwrap())
+    assert chat_config.mcp is not None
+    assert chat_config.mcp.enabled is True
+    assert chat_config.mcp.auto_start is True
+    assert len(chat_config.mcp.servers) == 2
+
+    # Check that the MCP config is merged from the chat config, project config, and the user config
+    # Should have 4 servers:
+    # - my-server (enabled in user config, disabled in project config)
+    # - my-server-2 (added in user config, not in project config, disabled in chat config)
+    # - my-server-3 (added in project config, not in user config)
+    # - my-server-4 (added in chat config, not in user config or project config)
+    config.chat = chat_config
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+    assert len(config.mcp.servers) == 4
+    my_server = next(s for s in config.mcp.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is False
+    my_server_2 = next(s for s in config.mcp.servers if s.name == "my-server-2")
+    assert my_server_2.name == "my-server-2"
+    assert my_server_2.enabled is False
+    my_server_3 = next(s for s in config.mcp.servers if s.name == "my-server-3")
+    assert my_server_3.name == "my-server-3"
+    assert my_server_3.enabled is True
+    assert my_server_3.command == "server-command-3"
+    assert my_server_3.args == ["--arg3", "--arg4"]
+    assert my_server_3.env == {"API_KEY": "your-key-3"}
+    my_server_4 = next(s for s in config.mcp.servers if s.name == "my-server-4")
+    assert my_server_4.name == "my-server-4"
+    assert my_server_4.enabled is True
+    assert my_server_4.command == "server-command-4"
+    assert my_server_4.args == ["--arg4", "--arg5"]
+    assert my_server_4.env == {"API_KEY": "your-key-4"}
+
+
+def test_mcp_config_loaded_from_toml():
+    config_toml = """[mcp]
+        enabled = true
+        auto_start = true
+
+        [[mcp.servers]]
+        name = "my-server"
+        enabled = true
+        command = "server-command"
+        args = ["--arg1", "--arg2"]
+        env = { API_KEY = "your-key" }
+    """
+    config_dict = tomlkit.loads(config_toml)
+    mcp = config_dict.pop("mcp", {})
+    config = MCPConfig.from_dict(mcp)
+
+    assert config.enabled is True
+    assert config.auto_start is True
+    assert len(config.servers) == 1
+    my_server = next(s for s in config.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is True
+    assert my_server.command == "server-command"
+    assert my_server.args == ["--arg1", "--arg2"]
+    assert my_server.env == {"API_KEY": "your-key"}
+
+
+def test_mcp_config_loaded_from_json():
+    config = MCPConfig.from_dict(json.loads(config_mcp_json))
+
+    assert config.enabled is True
+    assert config.auto_start is True
+    assert len(config.servers) == 1
+    my_server = next(s for s in config.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is True
+
+
+def test_chat_config_loaded_from_toml():
+    toml_doc = tomlkit.loads(chat_config_toml)
+    config = ChatConfig.from_dict(toml_doc.unwrap())
+
+    assert config.model == "gpt-4o"
+    assert config.tools == ["tool1", "tool2"]
+    assert config.tool_format == "markdown"
+    assert config.stream is True
+    assert config.interactive is True
+    assert config.workspace == Path.home() / "workspace"
+    assert config.env == {"API_KEY": "your-key"}
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+    assert len(config.mcp.servers) == 1
+    my_server = next(s for s in config.mcp.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is True
+    assert my_server.command == "server-command"
+    assert my_server.args == ["--arg1", "--arg2"]
+    assert my_server.env == {"API_KEY": "your-key"}
+
+
+def test_chat_config_loaded_from_json():
+    config = ChatConfig.from_dict(json.loads(config_json))
+
+    assert config.model == "gpt-4o"
+    assert config.tools == ["tool1", "tool2"]
+    assert config.tool_format == "markdown"
+    assert config.stream is True
+    assert config.interactive is True
+    assert config.workspace == Path.home() / "workspace"
+    assert config.env == {"API_KEY": "your-key"}
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+    assert len(config.mcp.servers) == 1
+    my_server = next(s for s in config.mcp.servers if s.name == "my-server")
+    assert my_server.name == "my-server"
+    assert my_server.enabled is True
+    assert my_server.command == "server-command"
+    assert my_server.args == ["--arg1", "--arg2"]
+    assert my_server.env == {"API_KEY": "your-key"}
+
+
+def test_chat_config_workspace_at_log(tmp_path):
+    """Test that workspace '@log' magic value resolves to logdir/workspace."""
+    logdir = tmp_path / "test-conversation"
+    logdir.mkdir()
+
+    config_dict = {
+        "chat": {"workspace": "@log"},
+        "_logdir": logdir,
+    }
+
+    config = ChatConfig.from_dict(config_dict)
+
+    # Should resolve to logdir/workspace
+    expected_workspace = logdir / "workspace"
+    assert config.workspace == expected_workspace
+
+    # Should create the directory
+    assert expected_workspace.exists()
+    assert expected_workspace.is_dir()
+
+
+def test_chat_config_workspace_at_log_without_logdir():
+    """Test that workspace '@log' raises error without logdir."""
+    config_dict = {"chat": {"workspace": "@log"}}
+
+    with pytest.raises(ValueError, match="Cannot use '@log' workspace without logdir"):
+        ChatConfig.from_dict(config_dict)
+
+
+def test_chat_config_to_dict():
+    config = ChatConfig.from_dict(json.loads(config_json))
+    config_dict = config.to_dict()
+    assert config_dict["chat"]["model"] == "gpt-4o"
+    assert config_dict["chat"]["tools"] == ["tool1", "tool2"]
+    assert config_dict["chat"]["tool_format"] == "markdown"
+    assert config_dict["chat"]["stream"] is True
+    assert config_dict["chat"]["interactive"] is True
+    assert config_dict["chat"]["workspace"] == "~/workspace"
+    assert config_dict["env"] == {"API_KEY": "your-key"}
+    assert config_dict["mcp"] == {
+        "enabled": True,
+        "auto_start": True,
+        "servers": [
+            {
+                "name": "my-server",
+                "enabled": True,
+                "command": "server-command",
+                "args": ["--arg1", "--arg2"],
+                "env": {"API_KEY": "your-key"},
+                "url": "",
+                "headers": {},
+            }
+        ],
+    }
+
+
+def test_chat_config_to_toml():
+    config = ChatConfig.from_dict(json.loads(config_json))
+    config_dict = config.to_dict()
+    toml_str = tomlkit.dumps(config_dict)
+    config_new = ChatConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new == config
+
+
+def test_default_chat_config_to_toml():
+    config = ChatConfig()
+    toml_str = tomlkit.dumps(config.to_dict())
+    config_new = ChatConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new == config
+
+
+def test_chat_config_max_tokens_default_omitted():
+    """max_tokens defaults to None and is omitted from serialization."""
+    config = ChatConfig()
+    assert config.max_tokens is None
+    assert "max_tokens" not in config.to_dict()["chat"]
+
+
+def test_chat_config_max_tokens_roundtrip():
+    """max_tokens is accepted from config and survives a to_dict/from_dict round-trip."""
+    config = ChatConfig.from_dict({"chat": {"max_tokens": 4096}})
+    assert config.max_tokens == 4096
+    assert config.to_dict()["chat"]["max_tokens"] == 4096
+
+    toml_str = tomlkit.dumps(config.to_dict())
+    config_new = ChatConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new.max_tokens == 4096
+
+
+def test_chat_config_temperature_top_p_default_omitted():
+    """temperature/top_p default to None and are omitted from serialization."""
+    config = ChatConfig()
+    assert config.temperature is None
+    assert config.top_p is None
+    assert "temperature" not in config.to_dict()["chat"]
+    assert "top_p" not in config.to_dict()["chat"]
+
+
+def test_chat_config_temperature_top_p_roundtrip():
+    """temperature and top_p survive a to_dict/from_dict round-trip."""
+    config = ChatConfig.from_dict({"chat": {"temperature": 0.7, "top_p": 0.9}})
+    assert config.temperature == 0.7
+    assert config.top_p == 0.9
+    assert config.to_dict()["chat"]["temperature"] == 0.7
+    assert config.to_dict()["chat"]["top_p"] == 0.9
+
+    toml_str = tomlkit.dumps(config.to_dict())
+    config_new = ChatConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new.temperature == 0.7
+    assert config_new.top_p == 0.9
+
+
+def test_chat_config_numeric_fields_reject_wrong_types():
+    """temperature, top_p, and max_tokens raise ValueError for non-numeric input."""
+    with pytest.raises(ValueError, match="temperature"):
+        ChatConfig.from_dict({"chat": {"temperature": "banana"}})
+    with pytest.raises(ValueError, match="top_p"):
+        ChatConfig.from_dict({"chat": {"top_p": "high"}})
+    with pytest.raises(ValueError, match="max_tokens"):
+        ChatConfig.from_dict({"chat": {"max_tokens": "a lot"}})
+    # booleans are a subtype of int but semantically wrong for max_tokens (0 or 1 token)
+    with pytest.raises(ValueError, match="max_tokens"):
+        ChatConfig.from_dict({"chat": {"max_tokens": True}})
+    with pytest.raises(ValueError, match="max_tokens"):
+        ChatConfig.from_dict({"chat": {"max_tokens": False}})
+
+
+def test_project_config_loaded_from_toml():
+    config = ProjectConfig.from_dict(tomlkit.loads(project_config_toml).unwrap())
+
+    assert config.files == ["README.md", "ARCHITECTURE.md", "rig.toml"]
+    assert config.context_cmd == "scripts/context.sh"
+    assert config.prompt == "You are a helpful assistant."
+    assert config.base_prompt == "My custom base prompt."
+    assert config.rag.enabled is True
+
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+
+    assert len(config.mcp.servers) == 2
+
+    sqlite_server = next(s for s in config.mcp.servers if s.name == "sqlite")
+    assert sqlite_server.name == "sqlite"
+    assert sqlite_server.enabled is True
+    assert sqlite_server.command == "uvx"
+    assert sqlite_server.args == ["mcp-server-sqlite", "--db-path", "database.db"]
+
+    oura_server = next(s for s in config.mcp.servers if s.name == "oura")
+    assert oura_server.name == "oura"
+    assert oura_server.enabled is True
+    assert oura_server.command == "uvx"
+    assert oura_server.args == ["oura-mcp-server"]
+
+    # Agent config
+    assert config.agent is not None
+    assert config.agent.name == "TestBot"
+    assert config.agent.avatar == "assets/avatar.png"
+    assert config.agent.urls == {
+        "dashboard": "https://testbot.example.com/dashboard/",
+        "repo": "https://github.com/testorg/testbot",
+    }
+
+
+def test_project_config_loaded_from_json():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+
+    assert config.files == ["README.md", "ARCHITECTURE.md", "rig.toml"]
+    assert config.context_cmd == "scripts/context.sh"
+    assert config.prompt == "You are a helpful assistant."
+    assert config.base_prompt == "My custom base prompt."
+    assert config.rag.enabled is True
+
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+
+    assert len(config.mcp.servers) == 2
+
+    sqlite_server = next(s for s in config.mcp.servers if s.name == "sqlite")
+    assert sqlite_server.name == "sqlite"
+    assert sqlite_server.enabled is True
+    assert sqlite_server.command == "uvx"
+    assert sqlite_server.args == ["mcp-server-sqlite", "--db-path", "database.db"]
+
+    oura_server = next(s for s in config.mcp.servers if s.name == "oura")
+    assert oura_server.name == "oura"
+    assert oura_server.enabled is True
+    assert oura_server.command == "uvx"
+    assert oura_server.args == ["oura-mcp-server"]
+
+    # Agent config
+    assert config.agent is not None
+    assert config.agent.name == "TestBot"
+    assert config.agent.avatar == "assets/avatar.png"
+    assert config.agent.urls == {
+        "dashboard": "https://testbot.example.com/dashboard/",
+        "repo": "https://github.com/testorg/testbot",
+    }
+
+
+def test_project_config_to_dict():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+    config_dict = config.to_dict()
+    assert config_dict["files"] == ["README.md", "ARCHITECTURE.md", "rig.toml"]
+    assert config_dict["context_cmd"] == "scripts/context.sh"
+    assert config_dict["prompt"] == "You are a helpful assistant."
+    assert config_dict["base_prompt"] == "My custom base prompt."
+    assert config_dict["rag"]["enabled"] is True
+    assert config_dict["mcp"]["enabled"] is True
+    assert config_dict["mcp"]["auto_start"] is True
+    assert len(config_dict["mcp"]["servers"]) == 2
+    assert config_dict["mcp"]["servers"][0]["name"] == "sqlite"
+    assert config_dict["mcp"]["servers"][0]["enabled"] is True
+    assert config_dict["mcp"]["servers"][0]["command"] == "uvx"
+    assert config_dict["mcp"]["servers"][0]["args"] == [
+        "mcp-server-sqlite",
+        "--db-path",
+        "database.db",
+    ]
+    assert config_dict["mcp"]["servers"][1]["name"] == "oura"
+    assert config_dict["mcp"]["servers"][1]["enabled"] is True
+    assert config_dict["mcp"]["servers"][1]["command"] == "uvx"
+    assert config_dict["mcp"]["servers"][1]["args"] == ["oura-mcp-server"]
+
+
+def test_project_config_to_toml():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+    config_dict = config.to_dict()
+    toml_str = tomlkit.dumps(config_dict)
+    config_new = ProjectConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new == config
+
+
+def test_project_config_ignores_unknown_top_level_keys():
+    """Forward-compat: unknown top-level keys should warn, not crash.
+
+    Before this fix, any unrecognized top-level section in rig.toml
+    (e.g. [user] placed in a project config, or a future section) would
+    be passed via **config_data to the dataclass constructor and raise
+    TypeError: unexpected keyword argument.
+    """
+    config_toml = """
+[prompt]
+files = ["README.md"]
+
+[user]
+name = "placed-in-project-config-by-mistake"
+
+[future_section_added_later]
+key = "value"
+"""
+    config = ProjectConfig.from_dict(tomlkit.loads(config_toml).unwrap())
+    assert config.files == ["README.md"]
+
+
+@pytest.mark.parametrize(
+    "section_name",
+    [
+        "rag",
+        "agent",
+        "lessons",
+        "context",
+        "context_selector",
+        "plugins",
+        "env",
+        "mcp",
+        "plugin",
+        "architect",
+    ],
+)
+def test_project_config_rejects_non_object_nested_sections(section_name: str):
+    with pytest.raises(ValueError, match=f"{section_name} must be an object"):
+        ProjectConfig.from_dict({section_name: "boom"})
+
+
+def test_project_config_rejects_non_list_mcp_servers():
+    with pytest.raises(ValueError, match="servers must be a list"):
+        ProjectConfig.from_dict({"mcp": {"servers": "not_a_list"}})
+
+
+def test_project_config_rejects_non_object_mcp_server_entries():
+    with pytest.raises(ValueError, match="servers entries must be objects"):
+        ProjectConfig.from_dict({"mcp": {"servers": ["not_an_object"]}})
+
+
+def test_resume_config_precedence():
+    """Test that resume configuration respects saved config unless CLI overrides provided."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "test-conversation"
+        logdir.mkdir()
+        workspace = Path(tmpdir) / "workspace"
+        workspace.mkdir()
+
+        # Create a saved conversation config with specific model and tool_format
+        saved_config_content = f"""[chat]
+model = "openrouter/test-model"
+tool_format = "xml"
+tools = ["shell", "python"]
+stream = true
+interactive = true
+workspace = "{workspace!s}"
+
+[env]
+"""
+
+        config_file = logdir / "config.toml"
+        config_file.write_text(saved_config_content)
+
+        # Test 1: Resume without CLI overrides - should use saved config
+        config = setup_config_from_cli(
+            workspace=workspace,
+            logdir=logdir,
+            model=None,  # No CLI override
+            tool_allowlist=None,  # No CLI override
+            tool_format=None,  # No CLI override
+            stream=True,
+            interactive=True,
+            agent_path=None,
+        )
+
+        assert config.chat is not None, "Chat config should be loaded"
+        assert config.chat.model == "openrouter/test-model", (
+            "Should use saved model when no CLI override"
+        )
+        assert config.chat.tool_format == "xml", (
+            "Should use saved tool_format when no CLI override"
+        )
+        assert config.chat.tools is not None and ("shell" in config.chat.tools), (
+            "Should use saved tools when no CLI override"
+        )
+
+        # Test 2: Resume with CLI overrides - should use CLI values
+        config = setup_config_from_cli(
+            workspace=workspace,
+            logdir=logdir,
+            model="anthropic/claude-3-sonnet",  # CLI override
+            tool_allowlist="read,save",  # CLI override
+            tool_format="markdown",  # CLI override
+            stream=True,
+            interactive=True,
+            agent_path=None,
+        )
+
+        assert config.chat is not None, "Chat config should be loaded"
+        assert config.chat.model == "anthropic/claude-3-sonnet", (
+            "Should use CLI model when provided"
+        )
+        assert config.chat.tool_format == "markdown", (
+            "Should use CLI tool_format when provided"
+        )
+        assert config.chat.tools == [
+            "read",
+            "save",
+        ], "Should use CLI tools when provided"
+
+        # Test 3: New conversation (no saved config) - should fall back to env/defaults
+        # Mock model default to None so we test the pure fallback to "markdown"
+        # (otherwise, if the default model has a default_tool_format, that takes precedence)
+        from unittest.mock import patch
+
+        new_logdir = Path(tmpdir) / "new-conversation"
+        new_logdir.mkdir()
+
+        with patch(
+            "rig.config.cli_setup._get_model_default_tool_format", return_value=None
+        ):
+            config = setup_config_from_cli(
+                workspace=workspace,
+                logdir=new_logdir,
+                model=None,  # No CLI override
+                tool_allowlist=None,  # No CLI override
+                tool_format=None,  # No CLI override
+                stream=True,
+                interactive=True,
+                agent_path=None,
+            )
+
+        # For new conversations, should use defaults/env (tool_format defaults to "markdown")
+        assert config.chat is not None, "Chat config should be loaded"
+        assert config.chat.tool_format == "markdown", (
+            "Should use default tool_format for new conversation"
+        )
+        # Model will depend on env vars, so we just check it's not the saved value
+        assert config.chat.model != "openrouter/test-model", (
+            "Should not use saved model for new conversation"
+        )
+
+
+def test_reload_config_clears_tools(monkeypatch, tmp_path):
+    """Test that reload_config() clears the tools cache so MCP tools are recreated."""
+    from unittest.mock import MagicMock
+
+    from rig.config import Config, _config_var, reload_config
+
+    # Set up initial config
+    _config_var.set(Config())
+
+    # Mock clear_tools in the tools module
+    mock_clear_tools = MagicMock()
+    monkeypatch.setattr("rig.tools.clear_tools", mock_clear_tools)
+
+    # Call reload_config
+    reload_config()
+
+    # Verify clear_tools was called
+    assert mock_clear_tools.called, "reload_config() should call clear_tools()"
+
+
+def test_user_identity_config_new_format():
+    """Test that [user] section is parsed correctly."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "I am a curious human programmer."
+response_preference = "Basic concepts don't need to be explained."
+
+[prompt]
+[prompt.project]
+myproject = "A cool project."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "I am a curious human programmer."
+            assert (
+                config.user.response_preference
+                == "Basic concepts don't need to be explained."
+            )
+            assert config.prompt.project == {"myproject": "A cool project."}
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_backward_compat():
+    """Test that old [prompt] about_user/response_preference still works as fallback."""
+    config_toml = """
+[prompt]
+about_user = "I am a legacy user."
+response_preference = "Keep it short."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            # Should fall back to [prompt] values
+            assert config.user.name == "User"
+            assert config.user.about == "I am a legacy user."
+            assert config.user.response_preference == "Keep it short."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_new_overrides_old():
+    """Test that [user] values take priority over [prompt] fallback."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "New about text."
+response_preference = "New preference."
+
+[prompt]
+about_user = "Old about text."
+response_preference = "Old preference."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            # [user] should take priority
+            assert config.user.name == "Erik"
+            assert config.user.about == "New about text."
+            assert config.user.response_preference == "New preference."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_defaults():
+    """Test that UserIdentityConfig has sensible defaults."""
+    identity = UserIdentityConfig()
+    assert identity.name == "User"
+    assert identity.about is None
+    assert identity.response_preference is None
+
+
+def test_user_config_ignores_unknown_keys_in_prompt_and_user():
+    """Forward-compat: unknown keys in [prompt] or [user] should warn, not crash.
+
+    Reproduces rig#2173: older rig bundled in archived rig-tauri v0.1.1
+    crashed with `TypeError: UserPromptConfig.__init__() got an unexpected keyword
+    argument 'files'` when reading a config written by a newer rig.
+    """
+    config_toml = """
+[prompt]
+about_user = "Hi"
+future_field_added_by_newer_rig = "should be ignored"
+
+[user]
+name = "Erik"
+some_future_user_key = 42
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "Hi"
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_partial_fallback():
+    """Test that fallback works per-field."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "Custom about."
+
+[prompt]
+response_preference = "Fallback preference."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "Custom about."
+            assert config.user.response_preference == "Fallback preference."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_config_local_toml(tmp_path):
+    """Test that config.local.toml is merged into the user config."""
+    # Create main config with preferences (committable to dotfiles)
+    main_config = tmp_path / "config.toml"
+    main_config.write_text(
+        '[prompt]\nabout_user = "I am a developer."\n\n[env]\nEDITOR = "vim"\n'
+    )
+
+    # Create local config with secrets (gitignored)
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        '[env]\nOPENAI_API_KEY = "sk-secret-123"\nEDITOR = "nvim"\n'
+    )
+
+    user_config = load_user_config(str(main_config))
+
+    # Local env values should be merged in, overriding main where they overlap
+    # (check user.env directly to avoid os.environ interference in CI)
+    assert user_config.env["OPENAI_API_KEY"] == "sk-secret-123"
+    assert user_config.env["EDITOR"] == "nvim"
+
+    # Non-overlapping values from main config should be preserved
+    assert user_config.prompt.about_user == "I am a developer."
+
+
+def test_user_config_local_toml_mcp_merge(tmp_path):
+    """Test that config.local.toml merges MCP server env vars into main config."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text(
+        "[prompt]\n\n"
+        "[mcp]\nenabled = true\nauto_start = true\n\n"
+        "[[mcp.servers]]\n"
+        'name = "my-server"\n'
+        'command = "server-cmd"\n'
+        'args = ["--arg1"]\n'
+    )
+
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        '[[mcp.servers]]\nname = "my-server"\nenv = { API_KEY = "secret-key" }\n'
+    )
+
+    config = Config(user=load_user_config(str(main_config)))
+
+    assert config.mcp.enabled is True
+    assert len(config.mcp.servers) == 1
+    server = config.mcp.servers[0]
+    assert server.name == "my-server"
+    assert server.command == "server-cmd"
+    assert server.env == {"API_KEY": "secret-key"}
+
+
+def test_user_config_no_local_toml(tmp_path):
+    """Test that missing config.local.toml doesn't cause errors."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text('[prompt]\nabout_user = "I am a developer."\n\n[env]\n')
+
+    # Should work fine without config.local.toml
+    config = Config(user=load_user_config(str(main_config)))
+    assert config.user.prompt.about_user == "I am a developer."
+
+
+def test_user_config_env_source_reports_main_local_and_env(tmp_path, monkeypatch):
+    """Effective env-backed setting source should follow env > local > main precedence."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text('[env]\nMODEL = "anthropic/claude-sonnet-4-7"\n')
+
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        '[env]\nOPENAI_API_KEY = "sk-local"\nMODEL = "openai/gpt-5"\n'
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.delenv("RIG_MODEL", raising=False)
+
+    assert (
+        get_user_config_env_source("OPENAI_API_KEY", str(main_config))
+        == USER_CONFIG_SOURCE_LOCAL
+    )
+    assert (
+        get_user_config_env_source("MODEL", str(main_config))
+        == USER_CONFIG_SOURCE_LOCAL
+    )
+
+    monkeypatch.setenv("MODEL", "xai/grok-4")
+    assert (
+        get_user_config_env_source("MODEL", str(main_config)) == USER_CONFIG_SOURCE_ENV
+    )
+
+    monkeypatch.delenv("MODEL", raising=False)
+    local_config.write_text('[env]\nOPENAI_API_KEY = "sk-local"\n')
+    assert (
+        get_user_config_env_source("MODEL", str(main_config)) == USER_CONFIG_SOURCE_MAIN
+    )
+
+
+def test_user_config_runtime_info_reports_paths_and_write_target(tmp_path):
+    """Runtime info should describe config merge and write behavior for the UI."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text("[env]\n")
+    (tmp_path / "config.local.toml").write_text("[env]\n")
+
+    info = get_user_config_runtime_info(str(main_config))
+
+    config_path = info["config_path"]
+    local_config_path = info["local_config_path"]
+    write_target = info["write_target"]
+
+    assert isinstance(config_path, str)
+    assert isinstance(local_config_path, str)
+    assert isinstance(write_target, str)
+
+    assert config_path.endswith("config.toml")
+    assert local_config_path.endswith("config.local.toml")
+    assert info["local_config_exists"] is True
+    assert write_target.endswith("config.toml")
+    assert info["local_overrides_main"] is True
+
+
+def test_cli_auto_envvar_prefix():
+    """Test that the main CLI command has auto_envvar_prefix='RIG' set."""
+    from rig.cli.main import main
+
+    # Verify the Click command has auto_envvar_prefix configured
+    assert main.context_settings.get("auto_envvar_prefix") == "RIG"
+
+    # Verify key options would resolve to expected RIG_* env var names
+    params = {p.name: p for p in main.params}
+    assert "model" in params, "CLI should have --model option"
+    assert "tool_format" in params, "CLI should have --tool-format option"
+    assert "prune_tool_output" in params, "CLI should have --prune-tool-output option"
+    assert "workspace" in params, "CLI should have --workspace option"
+
+
+def test_setup_config_from_cli_merges_prune_tool_output_override(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    (logdir / "config.toml").write_text(
+        f"""[chat]
+workspace = "{workspace!s}"
+
+[env]
+EXISTING = "1"
+"""
+    )
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        prune_tool_output=True,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.env["EXISTING"] == "1"
+    assert config.chat.env["PRUNE_TOOL_OUTPUT"] == "1"
+
+
+def test_tool_exclusion_config(tmp_path):
+    """Test that '-' prefixed tool_allowlist excludes tools from defaults."""
+    from rig.config import setup_config_from_cli
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    # Get default tools for comparison
+    from rig.tools import get_toolchain
+
+    default_tools = [tool.name for tool in get_toolchain(None)]
+    assert "browser" in default_tools or "shell" in default_tools, (
+        "Need at least one default tool to test exclusion"
+    )
+
+    # Pick a tool that exists in defaults to exclude
+    tool_to_exclude = default_tools[0]
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=f"-{tool_to_exclude}",
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools is not None
+    assert tool_to_exclude not in config.chat.tools, (
+        f"Excluded tool '{tool_to_exclude}' should not be in tools list"
+    )
+    # Other default tools should still be present (minus the excluded one)
+    remaining_defaults = [t for t in default_tools if t != tool_to_exclude]
+    for tool in remaining_defaults:
+        assert tool in config.chat.tools, (
+            f"Non-excluded default tool '{tool}' should still be present"
+        )
+
+
+def test_tool_exclusion_multiple(tmp_path):
+    """Test excluding multiple tools with '-' prefix."""
+    from rig.config import setup_config_from_cli
+    from rig.tools import get_toolchain
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    default_tools = [tool.name for tool in get_toolchain(None)]
+    # Exclude first two tools
+    tools_to_exclude = default_tools[:2]
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="-" + ",".join(tools_to_exclude),
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools is not None
+    for excluded in tools_to_exclude:
+        assert excluded not in config.chat.tools, (
+            f"Excluded tool '{excluded}' should not be in tools list"
+        )
+    # Also verify the remaining default tools are still present
+    remaining_defaults = [t for t in default_tools if t not in tools_to_exclude]
+    for tool in remaining_defaults:
+        assert tool in config.chat.tools, (
+            f"Default tool '{tool}' should still be in tools list after exclusion"
+        )
+
+
+def test_custom_tool_file_allowlist_preserved(tmp_path):
+    """Custom .py tool paths should survive CLI config setup unchanged."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    tool_file = tmp_path / "custom_tool.py"
+    tool_file.write_text(
+        "from rig.tools.base import ToolSpec\n\n"
+        "custom_tool = ToolSpec(name='custom_tool', desc='Custom tool')\n"
+    )
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=str(tool_file),
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools == [str(tool_file.resolve())]
+
+
+def test_custom_tool_file_mixed_allowlist(tmp_path):
+    """Named tools and custom .py file paths should both be preserved in a mixed allowlist."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    tool_file = tmp_path / "custom_tool.py"
+    tool_file.write_text(
+        "from rig.tools.base import ToolSpec\n\n"
+        "custom_tool = ToolSpec(name='custom_tool', desc='Custom tool')\n"
+    )
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=f"shell,{tool_file}",
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    tools = config.chat.tools
+    assert tools is not None
+    assert "shell" in tools
+    assert str(tool_file.resolve()) in tools
+
+
+def test_set_config_value_creates_intermediate_sections(tmp_path, monkeypatch):
+    """Test that set_config_value creates missing intermediate TOML sections.
+
+    Regression test: previously d.get(key, {}) returned a detached dict,
+    so writes to non-existent sections were silently lost.
+    """
+    import rig.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("")  # empty config
+
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    # Suppress reload_config (imported locally from rig.config.core)
+    monkeypatch.setattr("rig.config.core.reload_config", lambda: None)
+
+    user_mod.set_config_value("user.name", "Alice")
+
+    result = tomlkit.loads(config_file.read_text()).unwrap()
+    assert "user" in result
+    assert result["user"]["name"] == "Alice"
+
+
+def test_save_provider_config_upserts_existing_provider(tmp_path, monkeypatch):
+    """Repeated setup runs for the same provider should not append duplicates."""
+    import rig.config.user as user_mod
+    from rig.config.models import ProviderConfig
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("")
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+
+    user_mod.save_provider_config(
+        ProviderConfig(
+            name="local",
+            base_url="http://localhost:11434/v1",
+            default_model="llama3",
+        ),
+        reload=False,
+    )
+    user_mod.save_provider_config(
+        ProviderConfig(
+            name="local",
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="sk-local",
+            default_model="qwen3",
+        ),
+        reload=False,
+    )
+
+    result = tomlkit.loads(config_file.read_text()).unwrap()
+    assert len(result["providers"]) == 1
+    assert result["providers"][0] == {
+        "name": "local",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "api_key": "sk-local",
+        "default_model": "qwen3",
+    }
+
+
+def test_chat_config_save_transition_empty_dir_to_symlink(tmp_path):
+    """Test that save() replaces an empty from_logdir workspace directory with a symlink."""
+    logdir = tmp_path / "conversation-save-transition"
+
+    # Simulate from_logdir creating workspace dir
+    config = ChatConfig.from_logdir(logdir)
+    assert (logdir / "workspace").is_dir()
+    assert not (logdir / "workspace").is_symlink()
+
+    # Now save() with a workspace change — the empty dir should become a symlink
+    custom_workspace = tmp_path / "custom-workspace"
+    custom_workspace.mkdir()
+    config = replace(config, workspace=custom_workspace)
+    config._logdir = logdir
+    config.save()
+
+    assert (logdir / "workspace").is_symlink()
+    assert (logdir / "workspace").resolve() == custom_workspace
+
+
+def test_get_env_required_checks_rig_prefix(monkeypatch):
+    """Test that get_env_required checks RIG_ prefixed env vars like get_env does."""
+    from rig.config.models import UserConfig
+
+    config = Config(user=UserConfig())
+
+    # Set RIG_OPENAI_API_KEY but not OPENAI_API_KEY
+    monkeypatch.setenv("RIG_OPENAI_API_KEY", "test-key-123")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = config.get_env_required("OPENAI_API_KEY")
+    assert result == "test-key-123"
+
+
+def test_chat_config_from_logdir_creates_workspace(tmp_path):
+    """Test that from_logdir creates a per-conversation workspace directory."""
+    logdir = tmp_path / "conversation-abc"
+    workspace = logdir / "workspace"
+
+    assert not logdir.exists()
+    assert not workspace.exists()
+
+    config = ChatConfig.from_logdir(logdir)
+
+    assert workspace.is_dir()
+    assert config.workspace.resolve() == workspace.resolve()
+    assert config._logdir == logdir
+
+
+def test_chat_config_from_logdir_uses_existing_workspace(tmp_path):
+    """Test that from_logdir reuses an existing workspace directory."""
+    logdir = tmp_path / "conversation-existing"
+    workspace = logdir / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "existing_file.txt").write_text("hello")
+
+    assert logdir.is_dir()
+    assert workspace.is_dir()
+
+    config = ChatConfig.from_logdir(logdir)
+
+    assert config.workspace.resolve() == workspace.resolve()
+    assert (workspace / "existing_file.txt").exists()
+
+
+def test_chat_config_load_or_create_uses_cli_cwd_for_new_conversation(
+    tmp_path, monkeypatch
+):
+    """New conversations use the CLI workspace (cwd), not the auto-created logdir workspace.
+
+    from_logdir creates logdir/workspace as a server-safe default, but CLI sessions
+    should land in the user's current directory, not an isolated per-conversation dir.
+    Server sessions must explicitly pass workspace='@log' in their request config.
+    """
+    logdir = tmp_path / "conversation-new"
+    cli_cwd = tmp_path / "user-project"
+    cli_cwd.mkdir()
+    monkeypatch.chdir(cli_cwd)
+
+    config = ChatConfig.load_or_create(logdir, ChatConfig())
+
+    # CLI workspace (cwd) wins over the auto-created logdir/workspace.
+    assert config.workspace.resolve() == cli_cwd.resolve()
+
+
+def test_chat_config_load_or_create_server_explicit_log_workspace(
+    tmp_path, monkeypatch
+):
+    """Server sessions get logdir/workspace when they explicitly request '@log'."""
+    logdir = tmp_path / "conversation-server"
+    server_cwd = tmp_path / "server-cwd"
+    server_cwd.mkdir()
+    monkeypatch.chdir(server_cwd)
+
+    # Simulate what api_v2.py does: explicitly request @log workspace.
+    request_config = ChatConfig.from_dict(
+        {"_logdir": logdir, "chat": {"workspace": "@log"}},
+        create_workspace=False,
+    )
+    config = ChatConfig.load_or_create(logdir, request_config)
+
+    expected_workspace = (logdir / "workspace").resolve()
+    assert config.workspace.resolve() == expected_workspace
+
+
+def test_user_config_plugins_parsed(tmp_path):
+    """[plugins] in the user config is parsed (not an 'unknown key')."""
+    temp_user_config = str(tmp_path / "config.toml")
+    with open(temp_user_config, "w") as f:
+        f.write(default_user_config)
+        f.write('\n[plugins]\npaths = ["~/plugins"]\nenabled = ["rig-tts"]\n')
+    user = load_user_config(temp_user_config)
+    assert user.plugins.paths == ["~/plugins"]
+    assert user.plugins.enabled == ["rig-tts"]
+
+
+def test_get_plugin_config_layers_user_and_project(tmp_path):
+    """get_plugin_config merges user-level and project-level [plugins]."""
+    user_plugins = tmp_path / "user_plugins"
+    project_plugins = tmp_path / "project_plugins"
+    user_plugins.mkdir()
+    project_plugins.mkdir()
+
+    temp_user_config = str(tmp_path / "config.toml")
+    with open(temp_user_config, "w") as f:
+        f.write(default_user_config)
+        f.write(f'\n[plugins]\npaths = ["{user_plugins}"]\nenabled = ["user-plugin"]\n')
+
+    with open(tmp_path / "rig.toml", "w") as f:
+        f.write(
+            f'[plugins]\npaths = ["{project_plugins}"]\nenabled = ["project-plugin"]\n'
+        )
+
+    config = Config.from_workspace(tmp_path)
+    config = replace(config, user=load_user_config(temp_user_config))
+
+    paths, enabled = config.get_plugin_config()
+    resolved = {p.resolve() for p in paths}
+    assert user_plugins.resolve() in resolved
+    assert project_plugins.resolve() in resolved
+    assert enabled is not None
+    assert set(enabled) == {"user-plugin", "project-plugin"}
+
+
+def test_get_plugin_config_empty_enabled_is_none(tmp_path):
+    """No enabled allowlist anywhere => None (all plugins enabled)."""
+    temp_user_config = str(tmp_path / "config.toml")
+    with open(temp_user_config, "w") as f:
+        f.write(default_user_config)
+
+    config = Config.from_workspace(tmp_path)
+    config = replace(config, user=load_user_config(temp_user_config))
+    _paths, enabled = config.get_plugin_config()
+    assert enabled is None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for set_config_value traversal safety
+# ---------------------------------------------------------------------------
+
+
+def test_set_config_value_rejects_traversal_into_string(monkeypatch, tmp_path):
+    """Regression: PATCHing a keypath that traverses through a non-table value
+    (e.g. prompt.about_user.foo where about_user is a string) must raise a
+    clean ValueError instead of crashing with TypeError -> 500.
+
+    Bug surfaced via dogfood probe of /api/v2/user/config-file PATCH endpoint
+    (session bd4d). Before the fix, set_config_value blindly assigned into
+    any intermediate node, raising TypeError: 'String' object does not
+    support item assignment when the node was a string-valued TOML key.
+    """
+    import rig.config.user as user_mod
+
+    temp_config = tmp_path / "config.toml"
+    temp_config.write_text(default_user_config)
+
+    # Redirect set_config_value's writes to the temp config; skip the reload
+    # step (no need to refresh the in-memory config in a unit test).
+    monkeypatch.setattr(user_mod, "config_path", str(temp_config))
+
+    # Traversal through prompt.about_user (a string) must raise ValueError.
+    with pytest.raises(ValueError, match="not a table"):
+        user_mod.set_config_value("prompt.about_user.foo", "bar", reload=False)
+
+    # Two-level traversal through a string-valued leaf must also raise.
+    with pytest.raises(ValueError, match="not a table"):
+        user_mod.set_config_value("prompt.about_user.foo.bar", "baz", reload=False)
+
+    # Top-level traversal into a plain string-valued key must raise too.
+    with pytest.raises(ValueError, match="not a table"):
+        user_mod.set_config_value("prompt.response_preference.x", "y", reload=False)
+
+    # The config file must be untouched (no partial writes).
+    content = temp_config.read_text()
+    assert "foo" not in content
+    assert "bar" not in content
+
+
+def test_set_config_value_creates_nested_tables(monkeypatch, tmp_path):
+    """set_config_value still creates intermediate tables when the path is new,
+    so legitimate nested patches like models.new_nested.key are unaffected.
+    """
+    import rig.config.user as user_mod
+
+    temp_config = tmp_path / "config.toml"
+    temp_config.write_text(default_user_config)
+    monkeypatch.setattr(user_mod, "config_path", str(temp_config))
+
+    # Brand-new path: must create intermediate tables and write the leaf.
+    user_mod.set_config_value("models.new_nested.key", "hello", reload=False)
+    content = temp_config.read_text()
+    assert "[models.new_nested]" in content
+    assert 'key = "hello"' in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for unknown-key cleanup (issue #2969)
+# ---------------------------------------------------------------------------
+
+
+def test_load_user_config_strips_unknown_top_level_keys(tmp_path):
+    """Unknown top-level keys are stripped from disk on load so warnings don't repeat.
+
+    Regression for rig#2969: contaminated config accumulated foreign keys
+    (from fuzzing artifacts, server PUT, or external tooling) and produced
+    'Unknown keys in config' warnings on every invocation.
+    After load_user_config(), the file on disk must no longer contain those keys.
+    """
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[user]\nname = "Erik"\n\n'
+        "[env]\n\n"
+        # Contaminated keys — should be stripped on load
+        '[unknown_section]\nfoo = "bar"\n\n'
+        'another_foreign_key = "value"\n'
+    )
+
+    user = load_user_config(str(config_file))
+
+    # The known keys should still be loaded correctly
+    assert user.user.name == "Erik"
+
+    # The config file on disk must no longer contain the unknown keys
+    content_after = config_file.read_text()
+    assert "unknown_section" not in content_after
+    assert "another_foreign_key" not in content_after
+
+    # Loading again must produce no warnings about unknown keys
+    import io
+    import logging
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    logging.getLogger("rig.config.user").addHandler(handler)
+    try:
+        load_user_config(str(config_file))
+    finally:
+        logging.getLogger("rig.config.user").removeHandler(handler)
+    assert "Unknown keys in config" not in stream.getvalue()
+
+
+def test_load_user_config_preserves_known_keys_when_stripping(tmp_path):
+    """Known top-level keys are never stripped even when unknown keys are present."""
+    config_file = tmp_path / "config.toml"
+    # Note: in TOML, a bare key after a [section] header belongs to that section.
+    # Stray top-level keys must appear before any section header.
+    config_file.write_text(
+        'stray_key = "should be removed"\n\n'
+        '[user]\nname = "Alice"\n\n'
+        '[env]\nMY_VAR = "hello"\n\n'
+        '[models]\ndefault = "openai/gpt-4o"\n\n'
+        "[plugins]\npaths = []\n\n"
+        "[mcp]\nenabled = false\n\n"
+        "[lessons]\ndirs = []\n\n"
+        "[stray_section]\nfoo = 1\n"
+    )
+
+    user = load_user_config(str(config_file))
+
+    assert user.user.name == "Alice"
+    assert user.env["MY_VAR"] == "hello"
+    assert user.models.default == "openai/gpt-4o"
+    assert user.mcp is not None and user.mcp.enabled is False
+
+    content_after = config_file.read_text()
+    # Known sections must survive
+    assert "[user]" in content_after
+    assert "[env]" in content_after
+    assert "[models]" in content_after
+    assert "[plugins]" in content_after
+    assert "[mcp]" in content_after
+    assert "[lessons]" in content_after
+    # Unknown keys must be gone
+    assert "stray_key" not in content_after
+    assert "stray_section" not in content_after
+
+
+def test_load_user_config_strips_unknown_keys_from_local_config(tmp_path):
+    """Unknown keys in config.local.toml are also stripped on load."""
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[user]\nname = "Bob"\n\n[env]\n')
+
+    local_config = tmp_path / "config.local.toml"
+    # foreign_local_key must be at the top level (before any section header)
+    local_config.write_text(
+        'foreign_local_key = "should vanish"\n\n[env]\nSECRET = "abc"\n'
+    )
+
+    user = load_user_config(str(config_file))
+
+    assert user.env["SECRET"] == "abc"
+
+    local_after = local_config.read_text()
+    assert "foreign_local_key" not in local_after
+    assert 'SECRET = "abc"' in local_after
+
+
+def test_load_user_config_plugin_sections_preserved(tmp_path):
+    """[plugin.*] sections (known key) are never mistakenly stripped."""
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[user]\nname = "Test"\n\n'
+        "[env]\n\n"
+        "[plugin.headroom_compressor]\nbudget_tokens = 8000\n"
+    )
+
+    user = load_user_config(str(config_file))
+
+    assert user.plugin == {"headroom_compressor": {"budget_tokens": 8000}}
+
+    content_after = config_file.read_text()
+    assert "headroom_compressor" in content_after
+
+
+def test_chat_config_accepts_gear_field(tmp_path):
+    config = ChatConfig.from_dict({"chat": {"gear": 3, "workspace": str(tmp_path)}})
+
+    assert config.gear == 3
+
+
+@pytest.mark.parametrize("value", ["3", True])
+def test_chat_config_rejects_non_integer_gear(value):
+    with pytest.raises(ValueError, match="chat.gear must be an integer"):
+        ChatConfig.from_dict({"chat": {"gear": value}})
+
+
+def test_project_settings_gear_loaded():
+    config = ProjectConfig.from_dict({"settings": {"gear": 2}})
+
+    assert config.settings.gear == 2
+
+
+def test_setup_config_from_cli_applies_gear_preset(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        gear=2,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.gear == 2
+    assert config.chat.no_confirm is False
+    assert config.chat.tools == ["read", "patch", "save", "append"]
+
+
+def test_setup_config_from_cli_explicit_tools_override_gear(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read",
+        tool_format=None,
+        gear=3,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.gear == 3
+    assert config.chat.tools == ["read"]

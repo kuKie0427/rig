@@ -1,0 +1,366 @@
+import os
+import shutil
+from collections.abc import Generator
+from pathlib import Path
+
+import pytest
+import tomlkit
+
+# Import the minimal set of required modules
+from rig.config import MCPConfig, MCPServerConfig, UserConfig
+
+
+def test_mcp_cli_commands(monkeypatch):
+    """Test MCP CLI command logic without hitting the live registry."""
+    from click.testing import CliRunner
+
+    from rig.cli.cmd_mcp import mcp_info
+    from rig.mcp.registry import MCPRegistry
+
+    monkeypatch.setattr(
+        MCPRegistry,
+        "get_server_details",
+        lambda self, server_name: None,
+    )
+
+    # Test with mock data - this would normally use the config system
+    runner = CliRunner()
+
+    # Test info command with non-existent server - should exit 1 (server not found anywhere)
+    result = runner.invoke(mcp_info, ["nonexistent"])
+    assert result.exit_code == 1
+    # Updated to match improved error message that searches registries
+    assert "not configured locally" in result.output
+    assert "not found in registries either" in result.output
+
+
+def test_mcp_server_config_http():
+    """Test HTTP MCP server configuration"""
+    # Test HTTP server
+    http_server = MCPServerConfig(
+        name="test-http",
+        url="https://example.com/mcp",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert http_server.is_http is True
+    assert http_server.url == "https://example.com/mcp"
+    assert http_server.headers["Authorization"] == "Bearer token"
+
+    # Test stdio server
+    stdio_server = MCPServerConfig(name="test-stdio", command="echo", args=["hello"])
+    assert stdio_server.is_http is False
+    assert stdio_server.command == "echo"
+
+
+@pytest.fixture
+def test_config_path(tmp_path) -> Generator[Path, None, None]:
+    """Create a temporary config file for testing"""
+    # support both pipx and uvx
+    pyx_cmd, pyx_args = (
+        ("uvx", ["--from"]) if shutil.which("uvx") else ("pipx", ["run", "--spec"])
+    )
+    if not shutil.which(pyx_cmd):
+        pytest.skip("pipx or uvx not found in PATH")
+    if not shutil.which("npx"):
+        pytest.skip("npx not found in PATH")
+
+    mcp_server_sqlite = {
+        "name": "sqlite",
+        "enabled": True,
+        "command": pyx_cmd,
+        "args": [
+            *pyx_args,
+            "git+ssh://git@github.com/modelcontextprotocol/servers#subdirectory=src/sqlite",
+            "mcp-server-sqlite",
+        ],
+        "env": {},
+    }
+
+    mcp_server_memory = {
+        "name": "memory",
+        "enabled": True,
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-memory"],
+        "env": {"MEMORY_FILE_PATH": str(tmp_path / "memory.json")},
+    }
+
+    config_data = {
+        "prompt": {},
+        "env": {},
+        "mcp": {
+            "enabled": True,
+            "auto_start": True,
+            "servers": [mcp_server_sqlite, mcp_server_memory],
+        },
+    }
+
+    config_file = tmp_path / "config.toml"
+    with open(config_file, "w") as f:
+        tomlkit.dump(config_data, f)
+
+    os.environ["RIG_CONFIG"] = str(config_file)
+    yield config_file
+    del os.environ["RIG_CONFIG"]
+
+
+@pytest.fixture
+def mcp_config(test_config_path) -> UserConfig:
+    """Load MCP config from the test config file"""
+    with open(test_config_path) as f:
+        config_data = tomlkit.load(f)
+
+    mcp_data = config_data.get("mcp", {})
+    servers = [MCPServerConfig(**s) for s in mcp_data.get("servers", [])]
+    mcp = MCPConfig(
+        enabled=mcp_data.get("enabled", False),
+        auto_start=mcp_data.get("auto_start", False),
+        servers=servers,
+    )
+
+    return UserConfig(mcp=mcp)
+
+
+@pytest.fixture
+def mcp_client(mcp_config):
+    """Create an MCP client instance"""
+    from rig.mcp import MCPClient
+
+    return MCPClient(config=mcp_config)
+
+
+@pytest.mark.xfail(reason="Timeout in CI", strict=False)
+@pytest.mark.slow
+def test_sqlite_connection(mcp_client):
+    """Test connecting to SQLite MCP server"""
+    tools, session = mcp_client.connect("sqlite")
+    assert tools is not None
+    assert session is not None
+
+    # Verify tools are available
+    tool_names = [t.name for t in tools.tools]
+    assert "create_table" in tool_names
+    assert "write_query" in tool_names
+    assert "read_query" in tool_names
+
+
+@pytest.mark.xfail(reason="Timeout in CI", strict=False)
+@pytest.mark.slow
+def test_sqlite_operations(mcp_client):
+    """Test SQLite operations in sequence"""
+    mcp_client.connect("sqlite")
+
+    # Create test table
+    create_result = mcp_client.call_tool(
+        "create_table",
+        {
+            "query": """
+            CREATE TABLE IF NOT EXISTS test_users (
+                id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL
+            )
+            """
+        },
+    )
+    assert create_result is not None
+
+    # Insert test data
+    insert_result = mcp_client.call_tool(
+        "write_query",
+        {
+            "query": "INSERT INTO test_users (username, email) VALUES ('test1', 'test1@example.com')"
+        },
+    )
+    assert insert_result is not None
+
+    # Read test data
+    read_result = mcp_client.call_tool(
+        "read_query",
+        {"query": "SELECT * FROM test_users"},
+    )
+    assert "test1" in read_result
+    assert "test1@example.com" in read_result
+
+
+@pytest.mark.xfail(reason="Timeout in CI", strict=False)
+@pytest.mark.slow
+def test_memory_connection(mcp_client):
+    """Test connecting to Memory MCP server"""
+    tools, session = mcp_client.connect("memory")
+    assert tools is not None
+    assert session is not None
+
+    # Verify memory tools are available
+    tool_names = [t.name for t in tools.tools]
+    assert "create_entities" in tool_names
+    assert "create_relations" in tool_names
+    assert "add_observations" in tool_names
+    assert "read_graph" in tool_names
+    assert "search_nodes" in tool_names
+
+
+@pytest.mark.xfail(reason="Timeout in CI", strict=False)
+@pytest.mark.slow
+def test_memory_operations(mcp_client):
+    """Test Memory operations in sequence"""
+    mcp_client.connect("memory")
+
+    # Create test entity
+    create_result = mcp_client.call_tool(
+        "create_entities",
+        {
+            "entities": [
+                {
+                    "name": "test_user",
+                    "entityType": "person",
+                    "observations": ["Likes programming", "Uses Python"],
+                }
+            ]
+        },
+    )
+    assert create_result is not None
+
+    # Add observation
+    add_result = mcp_client.call_tool(
+        "add_observations",
+        {
+            "observations": [
+                {"entityName": "test_user", "contents": ["Contributes to open source"]}
+            ]
+        },
+    )
+    assert add_result is not None
+
+    # Read graph
+    read_result = mcp_client.call_tool("read_graph", {})
+    assert "test_user" in str(read_result)
+    assert "Likes programming" in str(read_result)
+    assert "Contributes to open source" in str(read_result)
+
+    # Search nodes
+    search_result = mcp_client.call_tool("search_nodes", {"query": "Python"})
+    assert "test_user" in str(search_result)
+
+
+def test_mcp_roots_management():
+    """Test MCP roots management methods"""
+    import mcp.types as types
+
+    from rig.mcp.client import MCPClient
+
+    # Create client without connecting to any server
+    client = MCPClient()
+
+    # Test initial state - no roots
+    assert client.get_roots() == []
+
+    # Test add_root (no session, so no notification sent)
+    result = client.add_root("file:///test/path", "Test Root")
+    assert result is True
+    roots = client.get_roots()
+    assert len(roots) == 1
+    assert str(roots[0].uri) == "file:///test/path"
+    assert roots[0].name == "Test Root"
+
+    # Test add another root
+    result = client.add_root("file:///another/path", "Another Root")
+    assert result is True
+    roots = client.get_roots()
+    assert len(roots) == 2
+
+    # Test adding duplicate root returns False
+    result = client.add_root("file:///test/path", "Duplicate Root")
+    assert result is False
+    roots = client.get_roots()
+    assert len(roots) == 2  # Should not have added the duplicate
+
+    # Test remove_root
+    removed = client.remove_root("file:///test/path")
+    assert removed is True
+    roots = client.get_roots()
+    assert len(roots) == 1
+    assert str(roots[0].uri) == "file:///another/path"
+
+    # Test remove non-existent root
+    removed = client.remove_root("file:///nonexistent")
+    assert removed is False
+
+    # Test set_roots
+    new_roots = [
+        types.Root(uri=types.FileUrl("file:///new/path1"), name="New Root 1"),
+        types.Root(uri=types.FileUrl("file:///new/path2"), name="New Root 2"),
+    ]
+    client.set_roots(new_roots)
+    roots = client.get_roots()
+    assert len(roots) == 2
+    assert str(roots[0].uri) == "file:///new/path1"
+    assert roots[0].name == "New Root 1"
+
+
+def test_mcp_roots_adapter_functions():
+    """Test MCP roots adapter functions"""
+    from rig.tools.mcp_adapter import add_mcp_root, list_mcp_roots, remove_mcp_root
+
+    # Test list_mcp_roots with no servers loaded
+    result = list_mcp_roots()
+    assert "No MCP servers loaded" in result
+
+    # Test list_mcp_roots for non-existent server
+    result = list_mcp_roots("nonexistent")
+    assert "not loaded" in result
+
+    # Test add_mcp_root for non-existent server
+    result = add_mcp_root("nonexistent", "file:///test", "Test")
+    assert "not loaded" in result
+
+    # Test remove_mcp_root for non-existent server
+    result = remove_mcp_root("nonexistent", "file:///test")
+    assert "not loaded" in result
+
+
+def test_mcp_client_event_loop_isolation():
+    """Test that creating multiple MCPClient instances doesn't pollute the global event loop.
+
+    Previously, MCPClient.__init__ called asyncio.set_event_loop(self.loop),
+    which meant each new client would overwrite the thread-global event loop.
+    With multiple MCP servers configured, this caused the last-created client's
+    loop to become the global one, potentially breaking async operations on
+    earlier clients or other code that relies on the global event loop.
+    """
+    import asyncio
+
+    from rig.mcp.client import MCPClient
+
+    # Save whatever the current event loop policy gives us
+    original_loop = None
+    try:
+        original_loop = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        # No current event loop — that's fine
+        pass
+
+    # Create multiple clients (simulating multiple MCP servers)
+    client_a = MCPClient()
+    client_b = MCPClient()
+    client_c = MCPClient()
+
+    # Each client should have its own distinct event loop
+    assert client_a.loop is not client_b.loop
+    assert client_b.loop is not client_c.loop
+    assert client_a.loop is not client_c.loop
+
+    # The global event loop should NOT have been changed by creating clients
+    try:
+        current_loop = asyncio.get_event_loop_policy().get_event_loop()
+        if original_loop is not None:
+            assert current_loop is original_loop, (
+                "MCPClient.__init__ should not change the thread-global event loop"
+            )
+    except RuntimeError:
+        # No event loop set — also acceptable if there wasn't one before
+        assert original_loop is None
+
+    # Clean up
+    client_a.loop.close()
+    client_b.loop.close()
+    client_c.loop.close()

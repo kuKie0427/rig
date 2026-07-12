@@ -1,0 +1,122 @@
+"""
+Tools for viewing images, giving the assistant vision.
+
+Requires a model which supports vision, such as GPT-4o, Anthropic, and Llama 3.2.
+"""
+
+import atexit
+import tempfile
+from pathlib import Path
+
+from PIL import Image
+
+from ..message import Message
+from .base import ToolFunction, ToolSpec
+
+# Track temp files for cleanup on exit
+_temp_files: list[Path] = []
+
+
+def _cleanup_temp_files() -> None:
+    for f in _temp_files:
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_temp_files)
+
+
+def view_image(image_path: "Path | str | Image.Image") -> Message:
+    """View an image. Large images (>1MB) will be automatically scaled down."""
+    # Handle PIL Image objects
+    if isinstance(image_path, Image.Image):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            image_path.save(tmp.name)
+            image_path = Path(tmp.name)
+            _temp_files.append(image_path)
+
+    if isinstance(image_path, str):
+        image_path = Path(image_path)
+
+    if not image_path.exists():
+        return Message("system", f"Image not found at `{image_path}`")
+
+    file_size = image_path.stat().st_size
+    MAX_SIZE = 1024 * 1024  # 1MB in bytes
+
+    with Image.open(image_path) as img:
+        dimensions: tuple[int, int] = (img.size[0], img.size[1])
+        msg_parts = [
+            f"Image size: {dimensions[0]}x{dimensions[1]}, {file_size / 1024:.1f}KB"
+        ]
+
+        if file_size <= MAX_SIZE:
+            msg_parts.append("No scaling required (under 1MB)")
+            return Message(
+                "system",
+                f"Viewing image at `{image_path}`\n" + "\n".join(msg_parts),
+                files=[image_path.absolute()],
+            )
+
+        # Convert RGBA to RGB if needed (convert both branches to ensure Image type)
+        out: Image.Image = (
+            img.convert("RGB") if img.mode == "RGBA" else img.convert(img.mode)
+        )
+
+        # First try just compressing as JPG without scaling
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            out.save(tmp.name, "JPEG", quality=85)
+            compressed_size = Path(tmp.name).stat().st_size
+            msg_parts.append(f"Compressed to: {compressed_size / 1024:.1f}KB")
+
+            # If compression alone wasn't enough, scale down and compress
+            if compressed_size > MAX_SIZE:
+                # Calculate scaling factor to get file size roughly under 1MB
+                scale_factor = (MAX_SIZE / compressed_size) ** 0.5
+                new_size: tuple[int, int] = (
+                    int(out.size[0] * scale_factor),
+                    int(out.size[1] * scale_factor),
+                )
+                msg_parts.append(f"Scaling from {dimensions} to {new_size}")
+
+                # Create a scaled version
+                scaled_img = out.resize(new_size, Image.Resampling.LANCZOS)
+                scaled_img.save(tmp.name, "JPEG", quality=85)
+                final_size = Path(tmp.name).stat().st_size
+                msg_parts.append(f"Final size after scaling: {final_size / 1024:.1f}KB")
+                dimensions = new_size
+
+            scaled_path = Path(tmp.name)
+            _temp_files.append(scaled_path)
+
+        action = "scaled and compressed" if compressed_size > MAX_SIZE else "compressed"
+        return Message(
+            "system",
+            f"Viewing {action} image ({dimensions[0]}x{dimensions[1]}) from {image_path}\n"
+            + "\n".join(msg_parts),
+            files=[scaled_path.absolute()],
+        )
+
+
+instructions = """
+### When to use vision
+
+Use vision when you have a local image file (screenshot, photo, diagram, chart,
+or plot) that needs visual inspection or analysis. Prefer vision over guessing
+from filenames — pass the actual pixels to the model.
+
+Do **not** use vision for:
+- Images at a URL — fetch with `read` or visit with `browser` instead
+- Taking a new screenshot — use the `screenshot` tool, then pass the path to vision
+
+Use the `view_image` Python function with `ipython` tool to view an image file.
+""".strip()
+
+tool = ToolSpec(
+    name="vision",
+    desc="Viewing images",
+    instructions=instructions,
+    functions=[ToolFunction.from_callable(view_image)],
+)

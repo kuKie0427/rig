@@ -1,0 +1,622 @@
+import copy
+import logging
+import os
+import threading
+from collections.abc import Callable, Generator
+from pathlib import Path
+
+from .commands import execute_cmd
+from .config import ChatConfig, get_config, require_workspace_exists
+from .constants import (
+    DECLINED_CONTENT,
+    INTERRUPT_CONTENT,
+    MAX_MESSAGE_LENGTH,
+    MAX_PROMPT_QUEUE_SIZE,
+)
+from .constants import (
+    prompt_user as prompt_user_styled,
+)
+from .hooks import HookType, trigger_hook
+from .init import init
+from .llm import reply
+from .llm.models import get_default_model, get_model
+from .logmanager import Log, LogManager, prepare_messages
+from .message import (
+    Message,
+    get_output_format,
+    is_output_json,
+    is_output_quiet,
+    set_output_format,
+)
+from .prompt_queue import drain_prompt_queue
+from .telemetry import set_conversation_context, trace_function
+from .tools import (
+    ToolFormat,
+    ToolUse,
+    execute_msg,
+    get_tools,
+)
+from .tools.complete import SessionCompleteException
+from .util import console, path_with_tilde
+from .util.auto_naming import MAX_ASSISTANT_MSGS_FOR_NAMING, try_auto_name
+from .util.context import include_paths
+from .util.cost import log_costs
+from .util.interrupt import clear_interruptible, set_interruptible
+from .util.prompt import add_history, get_input
+from .util.sound import print_bell
+from .util.terminal import flush_stdin, set_current_conv_name, terminal_state_title
+
+logger = logging.getLogger(__name__)
+
+
+@trace_function(name="chat.main", attributes={"component": "chat"})
+def chat(
+    prompt_msgs: list[Message],
+    initial_msgs: list[Message],
+    logdir: Path,
+    workspace: Path,
+    model: str | None,
+    stream: bool = True,
+    no_confirm: bool = False,
+    interactive: bool = True,
+    show_hidden: bool = False,
+    tool_allowlist: list[str] | None = None,
+    tool_format: ToolFormat | None = None,
+    output_schema: type | None = None,
+    output_format: str = "text",
+) -> None:
+    """
+    Run the chat loop.
+
+    prompt_msgs: list of messages to execute in sequence.
+    initial_msgs: list of history messages.
+    workspace: path to workspace directory.
+
+    Callable from other modules.
+    """
+    # Set initial terminal title with conversation name
+    conv_name = logdir.name
+    set_current_conv_name(conv_name)
+
+    # Set conversation context for telemetry
+    # This propagates to all spans in this conversation
+    set_conversation_context(conversation_id=conv_name)
+
+    # tool_format should already be resolved by this point
+    assert tool_format is not None, (
+        "tool_format should be resolved before calling chat()"
+    )
+
+    # Apply output format (must happen before any rendering).
+    # Save the caller's format so nested chat() calls (inline subagents) can
+    # restore it on exit instead of unconditionally resetting to "text".
+    _prev_output_format = get_output_format()
+    try:
+        set_output_format(output_format)
+
+        # init
+        # Mode detection for confirmation hooks is now handled inside init_hooks()
+        init(model, interactive, tool_allowlist, tool_format, no_confirm)
+
+        # Trigger session start hooks
+        if session_start_msgs := trigger_hook(
+            HookType.SESSION_START,
+            logdir=logdir,
+            workspace=workspace,
+            initial_msgs=initial_msgs,
+        ):
+            # Process any messages from session start hooks
+            for hook_msg in session_start_msgs:
+                initial_msgs = initial_msgs + [hook_msg]
+
+        default_model = get_default_model()
+        # Only require default_model if no explicit model was passed
+        # Use nested if/else for proper mypy type narrowing
+        if model is None:
+            if default_model is None:
+                raise ValueError("No model loaded and no model specified")
+            model_to_use = default_model.full
+        else:
+            model_to_use = model
+        modelmeta = get_model(model_to_use)
+        if not modelmeta.supports_streaming and stream:
+            logger.info(
+                "Disabled streaming for '%s/%s' model (not supported)",
+                modelmeta.provider,
+                modelmeta.model,
+            )
+            stream = False
+
+        if not is_output_json() and not is_output_quiet():
+            console.log(f"Using logdir: {path_with_tilde(logdir)}")
+        manager = LogManager.load(logdir, initial_msgs=initial_msgs, create=True)
+
+        # Note: todo replay is now handled via SESSION_START hook
+
+        # Initialize workspace
+        if not is_output_json() and not is_output_quiet():
+            console.log(f"Using workspace: {path_with_tilde(workspace)}")
+        require_workspace_exists(workspace)
+        os.chdir(workspace)
+
+        # print log (suppressed in JSON output mode and in quiet mode)
+        if not is_output_json() and not is_output_quiet():
+            # only draw a separator if any past messages were actually shown
+            if manager.log.print(show_hidden=show_hidden):
+                console.rule("[dim]past messages[/]", style="dim")
+
+        # Note: todo replay is now handled via SESSION_START hook
+        # Note: Confirmation is now handled within ToolUse.execute() using the hook system,
+        # so we no longer need to create and pass confirm_func.
+
+        # Convert prompt_msgs to a queue for unified handling
+        prompt_queue = list(prompt_msgs)
+
+        # main loop
+        _run_chat_loop(
+            manager,
+            prompt_queue,
+            stream,
+            tool_format=tool_format,
+            model=None,  # Pass None to allow dynamic model switching via /model command
+            interactive=interactive,
+            no_confirm=no_confirm,
+            logdir=logdir,
+            output_schema=output_schema,
+        )
+    except SessionCompleteException as e:
+        if not is_output_json() and not is_output_quiet():
+            console.log(f"Autonomous mode: {e}. Exiting.")
+
+        # Trigger session end hooks
+        if session_end_msgs := trigger_hook(
+            HookType.SESSION_END, logdir=logdir, manager=manager
+        ):
+            for msg in session_end_msgs:
+                manager.append(msg)
+    finally:
+        # Restore the caller's format so nested chat() calls (inline subagents)
+        # don't clobber the parent's JSON mode when they exit.
+        set_output_format(_prev_output_format)
+
+
+def _run_chat_loop(
+    manager,
+    prompt_queue,
+    stream,
+    tool_format=None,
+    model=None,
+    interactive=True,
+    no_confirm=False,
+    logdir=None,
+    output_schema=None,
+):
+    """Main chat loop - extracted to allow clean exception handling."""
+
+    while True:
+        _drain_external_prompt_queue(manager, prompt_queue)
+        msg: Message | None = None
+        try:
+            # Process next message (either from prompt queue or user input)
+            if prompt_queue:
+                msg = prompt_queue.pop(0)
+                assert msg is not None, "prompt_queue contained None"
+                msg = include_paths(msg, manager.workspace)
+                manager.append(msg)
+
+                # Handle user commands
+                if msg.role == "user" and execute_cmd(msg, manager):
+                    continue
+
+                if msg.role == "user":
+                    if turn_pre_msgs := trigger_hook(
+                        HookType.TURN_PRE,
+                        manager=manager,
+                    ):
+                        for hook_msg in turn_pre_msgs:
+                            manager.append(hook_msg)
+
+                # Process the message and get response
+                try:
+                    _process_message_conversation(
+                        manager, stream, tool_format, model, output_schema
+                    )
+                except SessionCompleteException:
+                    _drain_external_prompt_queue(manager, prompt_queue)
+                    if not prompt_queue:
+                        # No more prompts, properly exit
+                        raise
+                    # More chained prompts remain — continue processing them
+                    logger.debug(
+                        "complete called but %d chained prompts remain, continuing",
+                        len(prompt_queue),
+                    )
+                    continue
+            else:
+                # Get user input or exit if non-interactive
+                if not interactive:
+                    logger.debug("Non-interactive and exhausted prompts")
+                    break
+
+                user_input = _get_user_input(manager.log, manager.workspace)
+                if user_input is None:
+                    # Either user wants to exit OR we should generate response directly
+                    if _should_prompt_for_input(manager.log):
+                        # User wants to exit
+                        break
+                    # Don't prompt for input, generate response directly (crash recovery, etc.)
+                    # Process existing log without adding new message
+                    _process_message_conversation(
+                        manager,
+                        stream,
+                        tool_format,
+                        model,
+                        output_schema,
+                    )
+                else:
+                    # Normal case: user provided input
+                    msg = user_input
+                    manager.append(msg)
+
+                    # Reset interrupt flag since user provided new input
+
+                    # Handle user commands
+                    if msg.role == "user" and execute_cmd(msg, manager):
+                        continue
+
+                    # Trigger turn.pre hooks once per submitted user prompt,
+                    # after the prompt is appended and command handling has
+                    # declined to consume it.
+                    if turn_pre_msgs := trigger_hook(
+                        HookType.TURN_PRE,
+                        manager=manager,
+                    ):
+                        for hook_msg in turn_pre_msgs:
+                            manager.append(hook_msg)
+
+                    # Process the message and get response
+                    _process_message_conversation(
+                        manager,
+                        stream,
+                        tool_format,
+                        model,
+                        output_schema,
+                    )
+
+            # Trigger LOOP_CONTINUE hooks to check if we should continue/exit
+            # This handles auto-reply mechanism and other loop control logic
+            if loop_msgs := trigger_hook(
+                HookType.LOOP_CONTINUE,
+                manager=manager,
+                interactive=interactive,
+                prompt_queue=prompt_queue,
+                no_confirm=no_confirm,
+            ):
+                for msg in loop_msgs:
+                    # Add hook-generated messages to prompt queue with size limit
+                    if len(prompt_queue) >= MAX_PROMPT_QUEUE_SIZE:
+                        logger.warning(
+                            f"Prompt queue limit ({MAX_PROMPT_QUEUE_SIZE}) reached, "
+                            "dropping message from hook"
+                        )
+                        break
+                    prompt_queue.append(msg)
+                    if not is_output_json():
+                        console.log(f"[Loop control] {msg.content[:100]}...")
+                continue  # Process the queued messages
+
+        except KeyboardInterrupt:
+            if not is_output_json() and not is_output_quiet():
+                console.log("Interrupted.")
+            manager.append(Message("system", INTERRUPT_CONTENT))
+            # Clear any remaining prompts to avoid confusion
+            prompt_queue.clear()
+            continue
+
+    # Trigger session end hooks when exiting normally
+    if session_end_msgs := trigger_hook(
+        HookType.SESSION_END, logdir=logdir, manager=manager
+    ):
+        for msg in session_end_msgs:
+            manager.append(msg)
+
+
+def _drain_external_prompt_queue(
+    manager: LogManager, prompt_queue: list[Message]
+) -> None:
+    """Merge any durable queued prompts into the in-memory queue."""
+    capacity = MAX_PROMPT_QUEUE_SIZE - len(prompt_queue)
+    if capacity <= 0:
+        return
+
+    drained = drain_prompt_queue(manager.logdir, max_items=capacity)
+    if not drained:
+        return
+
+    prompt_queue.extend(drained)
+    logger.info("Loaded %d queued prompt(s) for %s", len(drained), manager.logdir.name)
+
+
+def _process_message_conversation(
+    manager: LogManager,
+    stream: bool,
+    tool_format: ToolFormat,
+    model: str | None,
+    output_schema: type | None = None,
+) -> None:
+    """Process a message and generate responses until no more tools to run.
+
+    Note: Confirmation is now handled within ToolUse.execute() using the hook system.
+    """
+    max_steps: int | None = None
+    max_steps_str = os.environ.get("RIG_MAX_STEPS")
+    if max_steps_str:
+        try:
+            max_steps = int(max_steps_str)
+        except ValueError:
+            logger.warning(
+                f"Invalid RIG_MAX_STEPS value: {max_steps_str!r}, ignoring"
+            )
+    step_count = 0
+
+    while True:
+        try:
+            set_interruptible()
+
+            # Trigger pre-process hooks (step.pre - before each step in a turn)
+            if pre_msgs := trigger_hook(
+                HookType.STEP_PRE,
+                manager=manager,
+            ):
+                for msg in pre_msgs:
+                    manager.append(msg)
+
+            response_msgs = list(
+                step(
+                    manager.log,
+                    stream,
+                    tool_format=tool_format,
+                    workspace=manager.workspace,
+                    model=model,
+                    output_schema=output_schema,
+                    logdir=manager.logdir,
+                )
+            )
+        except KeyboardInterrupt:
+            if not is_output_json() and not is_output_quiet():
+                console.log("Interrupted during response generation.")
+            manager.append(Message("system", INTERRUPT_CONTENT))
+            break
+        finally:
+            clear_interruptible()
+
+        for response_msg in response_msgs:
+            manager.append(response_msg)
+            # run any user-commands, if msg is from user
+            if response_msg.role == "user" and execute_cmd(response_msg, manager):
+                return
+
+        # Check if user declined execution - return to prompt without generating response
+        # This makes "n" at confirm prompt behave like Ctrl+C (return to user prompt)
+        if any(msg.content == DECLINED_CONTENT for msg in response_msgs):
+            if not is_output_json() and not is_output_quiet():
+                console.log("Execution declined, returning to prompt.")
+            break
+
+        # Auto-generate display name in background thread to avoid blocking.
+        # Shared logic with server in rig/util/auto_naming.py::try_auto_name.
+        # Pre-check assistant count to avoid spawning threads + doing disk I/O
+        # after the naming window has closed (> MAX_ASSISTANT_MSGS_FOR_NAMING).
+        current_model = get_default_model()
+        assistant_count = sum(1 for m in manager.log.messages if m.role == "assistant")
+        if current_model and 1 <= assistant_count <= MAX_ASSISTANT_MSGS_FOR_NAMING:
+            chat_config = ChatConfig.from_logdir(manager.logdir)
+            if not chat_config.name:
+                thread = threading.Thread(
+                    target=try_auto_name,
+                    args=(
+                        chat_config,
+                        copy.deepcopy(manager.log.messages),
+                        current_model.full,
+                    ),
+                    daemon=True,
+                )
+                thread.start()
+
+        # Check step limit (RIG_MAX_STEPS)
+        step_count += 1
+        if max_steps is not None and step_count >= max_steps:
+            if not is_output_json() and not is_output_quiet():
+                console.log(f"Reached max steps limit ({max_steps}), stopping.")
+            manager.append(
+                Message("system", f"Stopped: reached max steps limit ({max_steps})")
+            )
+            break
+
+        # Check if there are any runnable tools left
+        last_content = next(
+            (m.content for m in reversed(manager.log) if m.role == "assistant"),
+            "",
+        )
+        has_runnable = any(
+            tooluse.is_runnable for tooluse in ToolUse.iter_from_content(last_content)
+        )
+        if not has_runnable:
+            break
+
+    # Trigger post-process hooks after message processing completes (turn.post)
+    # Note: pre-commit checks and autocommit are now handled by hooks
+    if post_msgs := trigger_hook(
+        HookType.TURN_POST,
+        manager=manager,
+    ):
+        for msg in post_msgs:
+            manager.append(msg)
+
+
+def _should_prompt_for_input(log: Log) -> bool:
+    """
+    Determine if we should ask for user input or generate response directly.
+
+    Returns True if we should prompt for input, False if we should generate response.
+    This preserves the original logic for handling edge cases like crash recovery.
+    """
+    last_msg = log[-1] if log else None
+
+    # Check if there's an interrupt or decline message after the last assistant message
+    # This handles cases where hooks (like cost_awareness) add messages after the interrupt/decline
+    has_recent_interrupt_or_decline = False
+    for msg in reversed(log):
+        if msg.role == "assistant":
+            break
+        if msg.content in (INTERRUPT_CONTENT, DECLINED_CONTENT):
+            has_recent_interrupt_or_decline = True
+            break
+
+    # Ask for input when:
+    # - No messages at all
+    # - Last message was from assistant (normal flow)
+    # - There was an interrupt or decline after the last assistant message
+    # - Last message was pinned
+    # - No user messages exist in the entire log
+    return (
+        not last_msg
+        or last_msg.role == "assistant"
+        or has_recent_interrupt_or_decline
+        or last_msg.pinned
+        or not any(role == "user" for role in [m.role for m in log])
+    )
+
+
+def _get_user_input(log: Log, workspace: Path | None) -> Message | None:
+    """Get user input, returning None if user wants to exit."""
+    clear_interruptible()  # Don't interrupt during user input
+
+    # Check if we should prompt for input or generate response directly
+    if not _should_prompt_for_input(log):
+        # Last message was from user (crash recovery, edited log, etc.)
+        # Don't ask for input, let the system generate a response
+        return None
+
+    # print diff between now and last user message timestamp
+    if get_config().get_env_bool("RIG_SHOW_WORKED"):
+        last_user_msg = next((m for m in reversed(log) if m.role == "user"), None)
+        if last_user_msg and log:
+            diff = log[-1].timestamp - last_user_msg.timestamp
+            console.log(f"Worked for {diff.total_seconds():.2f} seconds")
+
+    try:
+        inquiry = prompt_user()
+        # Validate message length to prevent unbounded memory usage
+        truncation_suffix = "\n\n[Message truncated due to length]"
+        if len(inquiry) > MAX_MESSAGE_LENGTH:
+            logger.warning(
+                f"Message truncated from {len(inquiry)} to {MAX_MESSAGE_LENGTH} chars"
+            )
+            # Account for suffix length to stay within MAX_MESSAGE_LENGTH
+            inquiry = (
+                inquiry[: MAX_MESSAGE_LENGTH - len(truncation_suffix)]
+                + truncation_suffix
+            )
+        msg = Message("user", inquiry, quiet=True)
+        msg = include_paths(msg, workspace)
+        return msg
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+@trace_function(name="chat.step", attributes={"component": "chat"})
+def step(
+    log: Log | list[Message],
+    stream: bool,
+    tool_format: ToolFormat = "markdown",
+    workspace: Path | None = None,
+    model: str | None = None,
+    output_schema: type | None = None,
+    on_token: Callable[[str], None] | None = None,
+    logdir: Path | None = None,
+) -> Generator[Message, None, None]:
+    """Runs a single pass of the chat - generates response and executes tools."""
+    default_model = get_default_model()
+    # Only require default_model if no explicit model was passed
+    # Use nested if/else for proper mypy type narrowing
+    if model is None:
+        if default_model is None:
+            raise ValueError("No model loaded and no model specified")
+        model = default_model.full
+    if isinstance(log, list):
+        log = Log(log)
+
+    # Generate response and run tools
+    try:
+        set_interruptible()
+
+        # performs reduction/context trimming, if necessary
+        msgs = prepare_messages(log.messages, workspace, logdir=logdir)
+
+        tools = None
+        if tool_format == "tool":
+            tools = [t for t in get_tools() if t.is_runnable]
+
+        # generate response
+        with terminal_state_title("🤔 generating"):
+            msg_response = reply(
+                msgs,
+                get_model(model).full,
+                stream,
+                tools,
+                workspace,
+                output_schema,
+                on_token=on_token,
+            )
+            if get_config().get_env_bool("RIG_COSTS"):
+                log_costs(msgs + [msg_response])
+
+        # Trigger generation post hooks (e.g., TTS)
+        if generation_post_msgs := trigger_hook(
+            HookType.GENERATION_POST,
+            message=msg_response,
+            workspace=workspace,
+        ):
+            for msg in generation_post_msgs:
+                logger.debug(f"Generation post hook yielded: {msg}")
+
+        # log response and run tools
+        if msg_response:
+            yield msg_response.replace(quiet=True)
+            yield from execute_msg(msg_response, log=log, workspace=workspace)
+
+    finally:
+        clear_interruptible()
+
+
+def prompt_user(value=None) -> str:  # pragma: no cover
+    print_bell()
+    flush_stdin()
+    response = ""
+    # Get user name from config for the prompt display
+    user_name = get_config().user.user.name
+    styled_prompt = prompt_user_styled(user_name)
+    with terminal_state_title("⌨️ waiting for input"):
+        while not response:
+            try:
+                set_interruptible()
+                response = prompt_input(styled_prompt, value)
+                if response:
+                    add_history(response)
+            except KeyboardInterrupt:
+                print("\nInterrupted. Press Ctrl-D to exit.")
+            except EOFError:
+                raise  # Let _get_user_input handle the normal exit flow
+    clear_interruptible()
+    return response
+
+
+def prompt_input(prompt: str, value=None) -> str:  # pragma: no cover
+    """Get input using prompt_toolkit with fish-style suggestions."""
+    prompt = prompt.strip() + ": "
+    if value:
+        console.print(prompt + value)
+        return value
+
+    return get_input(prompt)

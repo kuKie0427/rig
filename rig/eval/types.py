@@ -1,0 +1,181 @@
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
+
+from typing_extensions import NotRequired
+
+if TYPE_CHECKING:
+    from .cost import CostSummary
+
+from ..message import Message
+from ..tools import ToolFormat
+
+Files = dict[str, str | bytes]
+Status = Literal["success", "error", "timeout"]
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Type-safe model + tool format pair, replacing string concatenation with '@'."""
+
+    model: str
+    tool_format: ToolFormat
+
+    def __str__(self) -> str:
+        return f"{self.model}@{self.tool_format}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {"model": self.model, "tool_format": self.tool_format}
+
+    @classmethod
+    def from_spec(
+        cls, spec: str, default_format: "ToolFormat | None" = None
+    ) -> "ModelConfig":
+        """Parse a 'model@format' spec string into a ModelConfig.
+
+        If the spec contains '@' and the suffix is a valid ToolFormat,
+        it's treated as a format separator. Otherwise '@' is part of the
+        model name (e.g. OpenRouter 'z-ai/glm-5@z-ai').
+        """
+        if "@" in spec:
+            model, fmt = spec.rsplit("@", 1)
+            if fmt in get_args(ToolFormat):
+                return cls(model=model, tool_format=cast(ToolFormat, fmt))
+            # '@' was part of model name, not a format separator
+        if default_format is not None:
+            return cls(model=spec, tool_format=default_format)
+        raise ValueError(f"No tool format in spec '{spec}' and no default provided")
+
+
+@dataclass
+class ResultContext:
+    """
+    Context for the result of a test.
+    """
+
+    files: Files
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+@dataclass
+class CaseResult:
+    """
+    Result of a single test case on the execution of a prompt.
+    """
+
+    name: str
+    passed: bool
+    duration: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "passed": self.passed, "duration": self.duration}
+
+
+@dataclass
+class EvalResult:
+    """
+    Result of executing an eval.
+    """
+
+    name: str
+    status: Status
+    results: list[CaseResult]
+    timings: dict[str, float]
+    gen_stdout: str
+    gen_stderr: str
+    run_stdout: str
+    run_stderr: str
+    log_dir: Path
+    workspace_dir: Path
+    cost: "CostSummary | None" = field(default=None)
+    tool_calls: int = field(default=0)
+    """Number of runnable tool calls in the parent conversation log.
+
+    For equal completion, fewer tool calls indicate a more efficient (cheaper,
+    faster) session — a tool-efficiency signal that scales with the suite. Counts
+    runnable tool-uses in assistant messages only (matching ``execute_msg``
+    semantics); nested subagent tool-uses are not counted.
+    """
+    tokens_input: int = field(default=0)
+    """Total input (prompt) tokens consumed during this eval task."""
+    tokens_output: int = field(default=0)
+    """Total output (completion) tokens generated during this eval task."""
+    cost_usd: float | None = field(default=None)
+    """Total cost in USD for this eval task, if model pricing is available."""
+    cache_read_tokens: int = field(default=0)
+    """Prompt-cache read tokens: input tokens served from cache (saved cost)."""
+    cache_creation_tokens: int = field(default=0)
+    """Prompt-cache write tokens: tokens used to populate the cache (extra cost)."""
+    cache_hit_rate: float = field(default=0.0)
+    """Fraction of input tokens served from cache (0.0–1.0)."""
+    num_steps: int = field(default=0)
+    """Number of LLM API calls made during this eval task (request_count).
+
+    Each step is one generation round-trip. Combined with tokens_input this
+    gives tokens-per-step — a cost lever independent of model choice.
+    """
+
+    @property
+    def tokens_total(self) -> int:
+        """Total tokens consumed (input + output) for this eval task."""
+        return self.tokens_input + self.tokens_output
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-compatible dict."""
+        d: dict[str, Any] = {
+            "name": self.name,
+            "status": self.status,
+            "passed": all(c.passed for c in self.results) if self.results else False,
+            "cases": [c.to_dict() for c in self.results],
+            "timings": self.timings,
+            "tool_calls": self.tool_calls,
+            "tokens_input": self.tokens_input,
+            "tokens_output": self.tokens_output,
+            "tokens_total": self.tokens_total,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_hit_rate": self.cache_hit_rate,
+            "num_steps": self.num_steps,
+        }
+        d["cost_usd"] = self.cost_usd  # always present; null when pricing unavailable
+        if self.cost is not None:
+            d["cost"] = self.cost.to_dict()
+        return d
+
+
+class EvalSpec(TypedDict):
+    """
+    Specification for an eval/test case.
+    """
+
+    name: str
+    files: Files
+    run: str
+    prompt: str
+    expect: dict[str, Callable[[ResultContext], bool]]
+    check_log: NotRequired[dict[str, Callable[[list[Message]], bool]]]
+    """Optional trajectory checks against the parent conversation log.
+
+    These are evaluated after generation using the messages stored in the eval
+    conversation log, enabling checks on delegation/tool-use behavior in
+    addition to file/stdout/stderr assertions.
+    """
+    tools: NotRequired[list[str]]
+    task_type: NotRequired[Literal["structured_process", "creative_restructuring"]]
+    """Task category for lesson injection gating.
+
+    ``structured_process``: Clear step-by-step procedure; lessons help. Lesson injection
+    enabled (default). ``creative_restructuring``: Open-ended synthesis; lessons may harm.
+    Lesson injection suppressed. Unset = backward-compatible default (lessons enabled).
+    """
+    restore_files: NotRequired[list[str]]
+    """Files to restore to original fixture content before the run phase.
+
+    Use this for input files that the model may overwrite as a side-effect during
+    generation (e.g. creating test data to verify a script), but where the run phase
+    needs the original fixture content. Do NOT list files the model is supposed to
+    modify as the goal of the task.
+    """

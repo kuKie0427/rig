@@ -1,0 +1,924 @@
+import importlib
+import json
+import os
+import subprocess
+import sys
+from concurrent.futures import CancelledError, TimeoutError
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
+
+import pytest
+from click.testing import CliRunner
+
+from rig.config import get_config
+from rig.eval import execute, tests
+from rig.eval.agents import Agent, GPTMe
+from rig.eval.main import main, resolve_eval_names, results_to_json
+from rig.eval.run import ProcessError, SyncedDict, act_process, run_evals
+from rig.eval.suites import suites, tests_map
+from rig.eval.types import CaseResult, EvalResult, ModelConfig
+from rig.message import Message
+
+# importlib.import_module returns the actual module object from sys.modules,
+# not the 'main' Click-command attribute exposed via rig/eval/__init__.py.
+# 'import rig.eval.main as x' would also get the Click command via IMPORT_FROM.
+_eval_main_module = importlib.import_module("rig.eval.main")
+
+if TYPE_CHECKING:
+    from rig.eval.types import EvalSpec
+
+
+def test_no_duplicate_test_names():
+    """Ensure all eval test names are unique across suites.
+
+    Note: rig.eval.suites raises ValueError at import time if a duplicate
+    exists, so if this module imports successfully the runtime guard has already
+    passed. This test is retained as explicit documentation and a structural
+    fallback in case the runtime guard is ever removed.
+
+    Duplicate names cause silent shadowing in tests_map (dict comprehension).
+    See: cce683d25 which fixed a 'write-tests' name collision.
+    """
+    seen: dict[str, str] = {}
+    for suite_name, suite_tests in suites.items():
+        for test in suite_tests:
+            name = test["name"]
+            assert name not in seen, (
+                f"Duplicate test name '{name}' in suite '{suite_name}' "
+                f"(already in '{seen[name]}')"
+            )
+            seen[name] = suite_name
+
+    # Verify tests_map has all tests (no shadowing occurred)
+    total_tests = sum(len(t) for t in suites.values())
+    assert len(tests_map) == total_tests, (
+        f"tests_map has {len(tests_map)} entries but {total_tests} tests exist "
+        f"— some names are duplicated and being shadowed"
+    )
+
+
+def test_suite_autodiscovery():
+    """Verify auto-discovery finds all practical suites and preserves ordering."""
+    # All practical suites should be discovered
+    practical_suites = [name for name in suites if name.startswith("practical")]
+    assert len(practical_suites) >= 19, (
+        f"Expected at least 19 practical suites, got {len(practical_suites)}: {practical_suites}"
+    )
+
+    # Verify numeric ordering across all discovered practical suites
+    expected_practical = ["practical"] + [
+        f"practical{i}" for i in range(2, len(practical_suites) + 1)
+    ]
+    assert practical_suites == expected_practical, (
+        f"Practical suites not in expected order.\n"
+        f"  Expected: {expected_practical}\n"
+        f"  Got:      {practical_suites}"
+    )
+
+    # Core suites should always be present
+    for core_suite in ("basic", "init_projects", "browser"):
+        assert core_suite in suites, f"Core suite '{core_suite}' missing"
+
+    # Every suite should have at least one test
+    for name, suite_tests in suites.items():
+        assert len(suite_tests) > 0, f"Suite '{name}' has no tests"
+
+    # Verify total test count matches flattened list
+    total_from_suites = sum(len(t) for t in suites.values())
+    assert len(tests) == total_from_suites, (
+        f"Flattened tests ({len(tests)}) != sum of suites ({total_from_suites})"
+    )
+
+
+def test_suite_aliases():
+    """Test that 'all' and 'all-practical' aliases expand to correct test sets via resolve_eval_names."""
+    all_resolved = resolve_eval_names(["all"])
+    practical_resolved = resolve_eval_names(["all-practical"])
+
+    # 'all' should include every test exactly once
+    assert len(all_resolved) == len(tests)
+    assert len(all_resolved) == len({t["name"] for t in all_resolved}), (
+        "duplicates in 'all'"
+    )
+
+    # 'all-practical' should include only practical tests
+    assert len(practical_resolved) > 0
+    for t in practical_resolved:
+        assert t in all_resolved, f"{t['name']} in all-practical but not in all"
+
+    # practical tests should be a strict subset of all tests
+    assert len(practical_resolved) < len(all_resolved)
+
+    # unknown alias should raise
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="not found"):
+        resolve_eval_names(["nonexistent-alias"])
+
+
+def test_alias_deduplication():
+    """Test that combining alias + explicit suite doesn't run tests twice."""
+    # 'practical' is the first practical suite; combining with 'all-practical' would add it twice
+    # without deduplication
+    deduped = resolve_eval_names(["all-practical", "practical"])
+
+    names = [t["name"] for t in deduped]
+    assert len(names) == len(set(names)), "duplicates remain after dedup"
+
+    # Result should equal all-practical alone (explicit 'practical' adds nothing new)
+    all_practical = resolve_eval_names(["all-practical"])
+    assert len(deduped) == len(all_practical)
+
+
+def test_list_tests():
+    """Test that --list prints available suites and tests."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["--list"])
+    assert result.exit_code == 0
+    assert "Available eval suites:" in result.output
+    assert "basic" in result.output
+    assert "hello *" in result.output
+    assert "Total:" in result.output
+    assert "Default suite:" in result.output
+    assert "all-practical" in result.output
+
+
+def test_list_tests_json():
+    """Test that --list --json outputs valid JSON with suite info."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["--list", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "suites" in data
+    assert "total_tests" in data
+    assert "default_suite" in data
+    assert len(data["suites"]) > 0
+    # Check suite structure
+    suite = data["suites"][0]
+    assert "name" in suite
+    assert "tests" in suite
+    assert len(suite["tests"]) > 0
+    # Check test structure
+    test = suite["tests"][0]
+    assert "name" in test
+    assert "default" in test
+
+
+def test_results_to_json():
+    """Test that results_to_json produces valid, well-structured output."""
+    config = ModelConfig(model="test-model", tool_format="markdown")
+    results = [
+        EvalResult(
+            name="test-hello",
+            status="success",
+            results=[
+                CaseResult(name="check_output", passed=True, duration=1.5),
+                CaseResult(name="check_file", passed=False, duration=0.3),
+            ],
+            timings={"gen": 5.0, "run": 1.0, "eval": 0.5},
+            gen_stdout="output",
+            gen_stderr="",
+            run_stdout="result",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+    ]
+    data = results_to_json({config: results}, commit_hash="abc123")
+
+    assert data["commit"] == "abc123"
+    assert "timestamp" in data
+    assert len(data["models"]) == 1
+
+    model_data = data["models"][0]
+    assert model_data["model"] == "test-model"
+    assert model_data["tool_format"] == "markdown"
+    assert model_data["total"] == 1
+    assert model_data["passed"] == 0  # not all cases passed
+    assert model_data["pass_rate"] == 0.0
+
+    result_data = model_data["results"][0]
+    assert result_data["name"] == "test-hello"
+    assert result_data["status"] == "success"
+    assert result_data["passed"] is False  # one case failed
+    assert len(result_data["cases"]) == 2
+    assert result_data["cases"][0]["passed"] is True
+    assert result_data["timings"]["gen"] == 5.0
+
+    # Verify JSON-serializable
+    json_str = json.dumps(data)
+    assert json.loads(json_str) == data
+
+
+def test_eval_result_token_fields_defaults():
+    """EvalResult has zero-default token fields and tokens_total property."""
+    result = EvalResult(
+        name="hello",
+        status="success",
+        results=[],
+        timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+        gen_stdout="",
+        gen_stderr="",
+        run_stdout="",
+        run_stderr="",
+        log_dir=Path("/tmp/log"),
+        workspace_dir=Path("/tmp/ws"),
+    )
+    assert result.tokens_input == 0
+    assert result.tokens_output == 0
+    assert result.tokens_total == 0
+    assert result.cost_usd is None
+    assert result.cache_read_tokens == 0
+    assert result.cache_creation_tokens == 0
+    assert result.cache_hit_rate == 0.0
+    assert result.num_steps == 0
+    # cost_usd must always appear in JSON output so consumers can rely on the field
+    d = result.to_dict()
+    assert "cost_usd" in d
+    assert d["cost_usd"] is None
+    assert d["cache_read_tokens"] == 0
+    assert d["cache_creation_tokens"] == 0
+    assert d["cache_hit_rate"] == 0.0
+    assert d["num_steps"] == 0
+
+
+def test_eval_result_token_fields_populated():
+    """EvalResult exposes token counts, caching, and num_steps in to_dict."""
+    result = EvalResult(
+        name="hello",
+        status="success",
+        results=[CaseResult(name="ok", passed=True, duration=0.1)],
+        timings={"gen": 2.0, "run": 0.5, "eval": 0.1},
+        gen_stdout="",
+        gen_stderr="",
+        run_stdout="",
+        run_stderr="",
+        log_dir=Path("/tmp/log"),
+        workspace_dir=Path("/tmp/ws"),
+        tokens_input=1500,
+        tokens_output=300,
+        cost_usd=0.012,
+        cache_read_tokens=800,
+        cache_creation_tokens=200,
+        cache_hit_rate=0.53,
+        num_steps=4,
+    )
+    assert result.tokens_input == 1500
+    assert result.tokens_output == 300
+    assert result.tokens_total == 1800
+    assert result.cost_usd == 0.012
+    assert result.cache_read_tokens == 800
+    assert result.cache_creation_tokens == 200
+    assert result.cache_hit_rate == 0.53
+    assert result.num_steps == 4
+
+    d = result.to_dict()
+    assert d["tokens_input"] == 1500
+    assert d["tokens_output"] == 300
+    assert d["tokens_total"] == 1800
+    assert d["cost_usd"] == 0.012
+    assert d["cache_read_tokens"] == 800
+    assert d["cache_creation_tokens"] == 200
+    assert d["cache_hit_rate"] == 0.53
+    assert d["num_steps"] == 4
+
+    # Verify JSON-serializable
+    assert json.loads(json.dumps(d)) == d
+
+
+def test_eval_result_token_fields_in_json_output():
+    """results_to_json includes top-level token metrics per result."""
+    config = ModelConfig(model="test-model", tool_format="tool")
+    results = [
+        EvalResult(
+            name="task-1",
+            status="success",
+            results=[CaseResult(name="ok", passed=True, duration=0.1)],
+            timings={"gen": 3.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+            tokens_input=2000,
+            tokens_output=500,
+            cost_usd=0.025,
+        ),
+    ]
+    data = results_to_json({config: results})
+    result_data = data["models"][0]["results"][0]
+    assert result_data["tokens_input"] == 2000
+    assert result_data["tokens_output"] == 500
+    assert result_data["tokens_total"] == 2500
+    assert result_data["cost_usd"] == 0.025
+
+
+def test_results_to_json_all_passing():
+    """Test pass rate calculation when all cases pass."""
+    config = ModelConfig(model="good-model", tool_format="tool")
+    results = [
+        EvalResult(
+            name="test-1",
+            status="success",
+            results=[CaseResult(name="c1", passed=True, duration=1.0)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+        EvalResult(
+            name="test-2",
+            status="success",
+            results=[CaseResult(name="c1", passed=True, duration=1.0)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+    ]
+    data = results_to_json({config: results})
+    assert data["models"][0]["pass_rate"] == 1.0
+    assert data["models"][0]["passed"] == 2
+    assert data["models"][0]["total"] == 2
+
+
+def test_results_to_json_tokens_per_task_aggregate():
+    """Model summary includes mean tokens_per_task for harness comparison."""
+    config = ModelConfig(model="efficient-model", tool_format="tool")
+    results = [
+        EvalResult(
+            name="task-a",
+            status="success",
+            results=[CaseResult(name="ok", passed=True, duration=0.1)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+            tokens_input=1000,
+            tokens_output=200,
+            cost_usd=0.01,
+        ),
+        EvalResult(
+            name="task-b",
+            status="success",
+            results=[CaseResult(name="ok", passed=True, duration=0.1)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+            tokens_input=3000,
+            tokens_output=600,
+            cost_usd=0.03,
+        ),
+    ]
+    data = results_to_json({config: results})
+    model_data = data["models"][0]
+    assert model_data["tokens_per_task"] == 2400.0
+    assert model_data["tokens_input_per_task"] == 2000.0
+    assert model_data["tokens_output_per_task"] == 400.0
+    assert model_data["total_tokens"] == 4800
+    assert model_data["total_cost_usd"] == 0.04
+
+
+@pytest.mark.slow
+def test_eval_module_loading(tmp_path):
+    """Test that --eval-module loads and registers tests from an external module."""
+    # Write a minimal eval module with a tests list
+    module_file = tmp_path / "my_feature_eval.py"
+    module_file.write_text(
+        """\
+def check_file_exists(ctx):
+    return "main.py" in ctx.files
+
+FEATURE = "my-feature"
+PROMPT = "Create a main.py file."
+CHECKS = [check_file_exists]
+tests = [
+    {
+        "name": FEATURE or "spec-kit-eval",
+        "files": {},
+        "run": "python main.py",
+        "prompt": PROMPT,
+        "expect": {fn.__name__: fn for fn in CHECKS},
+    }
+]
+"""
+    )
+
+    captured_evals: list = []
+
+    def fake_run_evals(evals, *args, **kwargs):
+        captured_evals.extend(evals)
+        return {}
+
+    runner = CliRunner()
+    saved_path = list(sys.path)
+    modules_before = frozenset(sys.modules)
+    try:
+        with (
+            # Use patch.object to avoid mock._importer resolving "rig.eval.main"
+            # via getattr(rig.eval, "main") which returns the Click command instead
+            # of the submodule (rig/eval/__init__.py overrides the attribute).
+            patch.object(_eval_main_module, "run_evals", side_effect=fake_run_evals),
+            runner.isolated_filesystem(),
+        ):
+            result = runner.invoke(
+                main,
+                ["--eval-module", str(module_file), "--model", "anthropic"],
+                catch_exceptions=False,
+            )
+    finally:
+        # Restore global state mutated by the module loader (sys.path / sys.modules).
+        # Only remove newly added modules — clearing all of sys.modules is too
+        # aggressive and can corrupt pytest's import state in xdist workers.
+        sys.path[:] = saved_path
+        for key in list(sys.modules):
+            if key not in modules_before:
+                del sys.modules[key]
+    # Module loaded without error and the test was passed to run_evals
+    assert result.exit_code == 0, f"Unexpected exit: {result.output}"
+    assert len(captured_evals) == 1, f"Expected 1 eval, got {captured_evals}"
+    assert captured_evals[0]["name"] == "my-feature"
+    # Key: should NOT fail with "module must define a 'tests' list"
+    assert "must define a 'tests' list" not in (result.output or "")
+
+
+def test_eval_cli_user_context_flag_propagation():
+    """CLI should default to isolated evals and allow explicit opt-in."""
+    captured: list[bool] = []
+
+    def fake_run_evals(evals, *args, **kwargs):
+        captured.append(kwargs["include_user_context"])
+        return {}
+
+    runner = CliRunner()
+    with (
+        patch.object(_eval_main_module, "run_evals", side_effect=fake_run_evals),
+        patch.object(_eval_main_module, "print_model_results", return_value=None),
+        patch.object(_eval_main_module, "print_model_results_table", return_value=None),
+        patch.object(_eval_main_module, "write_results", return_value=None),
+    ):
+        result = runner.invoke(main, ["hello", "--model", "anthropic"])
+        assert result.exit_code == 0, result.output
+        assert captured == [False]
+
+        captured.clear()
+        result = runner.invoke(
+            main, ["hello", "--model", "anthropic", "--user-context"]
+        )
+        assert result.exit_code == 0, result.output
+        assert captured == [True]
+
+
+def test_eval_agent_passes_user_context_flag(monkeypatch, tmp_path):
+    """GPTMe eval agent should opt out by default and allow explicit opt-in."""
+    captured: list[bool] = []
+
+    monkeypatch.setattr("rig.eval.agents.get_logs_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "rig.eval.agents.generate_conversation_id",
+        lambda prefix, _log_dir: prefix,
+    )
+    monkeypatch.setattr(
+        "rig.eval.agents.prepare_execution_environment",
+        lambda workspace, tools: (None, []),
+    )
+
+    def fake_get_prompt(*args, **kwargs):
+        captured.append(kwargs["include_user_context"])
+        return [Message("system", "base prompt")]
+
+    monkeypatch.setattr("rig.eval.agents.get_prompt", fake_get_prompt)
+    monkeypatch.setattr("rig.eval.agents.rig_chat", lambda *args, **kwargs: None)
+
+    GPTMe(model="test-model", tool_format="markdown").act(None, "hello")
+    GPTMe(
+        model="test-model",
+        tool_format="markdown",
+        include_user_context=True,
+    ).act(None, "hello")
+
+    assert captured == [False, True]
+
+
+def test_eval_agent_attaches_fixture_files(monkeypatch, tmp_path):
+    """GPTMe eval agent should attach workspace fixtures to the user prompt."""
+    captured_messages: list[Message] = []
+
+    monkeypatch.setattr("rig.eval.agents.get_logs_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "rig.eval.agents.generate_conversation_id",
+        lambda prefix, _log_dir: prefix,
+    )
+    monkeypatch.setattr(
+        "rig.eval.agents.prepare_execution_environment",
+        lambda workspace, tools: (None, []),
+    )
+    monkeypatch.setattr(
+        "rig.eval.agents.get_prompt",
+        lambda *args, **kwargs: [Message("system", "base prompt")],
+    )
+
+    def fake_chat(messages, *args, **kwargs):
+        captured_messages.extend(messages)
+
+    monkeypatch.setattr("rig.eval.agents.rig_chat", fake_chat)
+
+    agent = GPTMe(model="test-model", tool_format="markdown")
+    agent.act({"stats.py": "x = 1\n", "test_stats.py": "assert True\n"}, "fix bug")
+
+    assert len(captured_messages) == 1
+    msg = captured_messages[0]
+    assert msg.content == "fix bug"
+    fixture_paths = [f for f in msg.files if isinstance(f, Path)]
+    assert len(fixture_paths) == 2
+    assert {p.name for p in fixture_paths} == {"stats.py", "test_stats.py"}
+    assert all(p.parent == agent.workspace_dir for p in fixture_paths)
+    assert all(p.exists() for p in fixture_paths)
+
+
+def _detect_model():
+    # detect which model is configured (manual since init() hasn't run in tests)
+    config = get_config()
+    if model := config.get_env("MODEL"):
+        return model
+    if config.get_env("OPENAI_API_KEY"):
+        return "openai"
+    if config.get_env("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    pytest.skip("No API key found for OpenAI or Anthropic")
+
+
+@pytest.mark.slow
+@pytest.mark.requires_api
+@pytest.mark.skipif(
+    "glm" in os.getenv("MODEL", "").lower(),
+    reason="GLM models don't reliably call the complete tool",
+)
+def test_eval_cli():
+    model = _detect_model()
+    runner = CliRunner()
+    test_set = ["hello"]
+    result = runner.invoke(
+        main,
+        [
+            *test_set,
+            "--model",
+            model,
+        ],
+    )
+    assert result
+    assert result.exit_code == 0
+    assert "correct file" in result.output
+    assert "correct output" in result.output
+
+
+# No idea why, but for some reason keeping this leads to better coverage than the above
+@pytest.mark.slow
+@pytest.mark.requires_api
+@pytest.mark.skipif(
+    "glm" in os.getenv("MODEL", "").lower(),
+    reason="GLM models don't reliably call the complete tool",
+)
+def test_eval(test):
+    """
+    This test will be run for each eval in the tests list.
+    See pytest_generate_tests() below.
+    """
+    provider = _detect_model()
+    agent = GPTMe(provider)
+    result = execute(test, agent, timeout=30, parallel=False)
+    assert result.results
+    assert all(case.passed for case in result.results)
+
+
+# Hook to generate tests from the tests list
+def pytest_generate_tests(metafunc):
+    if "test" in metafunc.fixturenames:
+        # for now, only run the hello-patch test (the "hello" test is unreliable with gpt-4o-mini)
+        allowlist = ["hello-patch"]
+        test_set, test_names = zip(
+            *[(test, test["name"]) for test in tests if test["name"] in allowlist]
+        )
+        metafunc.parametrize("test", test_set, ids=test_names)
+
+
+class TimeoutAgent(Agent):
+    def act(
+        self, files: dict[str, str | bytes] | None, prompt: str
+    ) -> dict[str, str | bytes]:
+        raise subprocess.TimeoutExpired(cmd="claude -p", timeout=7)
+
+
+class SuccessAgent(Agent):
+    def act(
+        self, files: dict[str, str | bytes] | None, prompt: str
+    ) -> dict[str, str | bytes]:
+        return {"out.txt": "done"}
+
+
+def test_act_process_maps_subprocess_timeout_to_timeout_result():
+    sync_dict = cast(SyncedDict, {})
+    agent = TimeoutAgent(model="claude-code/test")
+
+    with patch("rig.eval.run._graceful_killpg"):
+        act_process(
+            agent=agent,
+            test_name="timeout-case",
+            prompt="do thing",
+            files={},
+            sync_dict=sync_dict,
+            parallel=True,
+            suppress_output=True,
+        )
+
+    result = cast(ProcessError, sync_dict["result"])
+    assert result["status"] == "timeout"
+    assert result["duration"] >= 0
+    assert result["message"]
+
+
+def test_execute_docker_mode_runs_checks_in_docker_env():
+    test: EvalSpec = {
+        "name": "docker-check",
+        "files": {},
+        "prompt": "write output",
+        "run": "cat out.txt",
+        "expect": {"has output": lambda ctx: ctx.files.get("out.txt") == "done"},
+    }
+    agent = SuccessAgent(model="claude-code/test")
+
+    with patch("rig.eval.run.DockerExecutionEnv") as MockDockerEnv:
+        env = MockDockerEnv.return_value
+        env.run.return_value = ("done", "", 0)
+        env.download.return_value = {"out.txt": "done"}
+
+        result = execute(
+            test=test,
+            agent=agent,
+            timeout=5,
+            parallel=False,
+            use_docker=True,
+        )
+
+    MockDockerEnv.assert_called_once()
+    env.upload.assert_called_once_with({"out.txt": "done"})
+    env.run.assert_called_once_with("cat out.txt")
+    env.cleanup.assert_called_once()
+    assert result.status == "success"
+    assert all(case.passed for case in result.results)
+    assert result.run_stdout == "done"
+
+
+def test_execute_runs_check_log_against_conversation_messages():
+    test: EvalSpec = {
+        "name": "trajectory-check",
+        "files": {},
+        "prompt": "write output",
+        "run": "cat out.txt",
+        "expect": {"has output": lambda ctx: ctx.files.get("out.txt") == "done"},
+        "check_log": {
+            "saw delegated assistant message": lambda messages: any(
+                msg.role == "assistant" and "delegated to subagent" in msg.content
+                for msg in messages
+            )
+        },
+    }
+    agent = SuccessAgent(model="claude-code/test")
+    fake_messages = [
+        Message("assistant", "delegated to subagent"),
+        Message("system", "✅ Subagent 'demo' completed: done"),
+    ]
+
+    with (
+        patch("rig.eval.run.SimpleExecutionEnv") as MockEnv,
+        patch("rig.eval.run.LogManager.load") as mock_load,
+    ):
+        env = MockEnv.return_value
+        env.run.return_value = ("done", "", 0)
+        env.download.return_value = {"out.txt": "done"}
+        mock_load.return_value = SimpleNamespace(
+            log=SimpleNamespace(messages=fake_messages)
+        )
+
+        result = execute(test=test, agent=agent, timeout=5, parallel=False)
+
+    assert result.status == "success"
+    assert [case.name for case in result.results] == [
+        "has output",
+        "saw delegated assistant message",
+    ]
+    assert all(case.passed for case in result.results)
+    mock_load.assert_called_once_with(agent.log_dir, lock=False)
+
+
+def test_run_evals_top_level_timeout_cancels_pending_futures(tmp_path):
+    class FakeFuture:
+        def __init__(self, result: EvalResult):
+            self._result = result
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+        def result(self, timeout=None):
+            if self.cancelled:
+                raise CancelledError
+            return self._result
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+            self.futures: list[FakeFuture] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(
+            self, fn, test, agent, timeout, parallel, use_docker, **kwargs
+        ) -> FakeFuture:
+            result = EvalResult(
+                name=test["name"],
+                status="success",
+                results=[CaseResult(name="ok", passed=True, duration=0.0)],
+                timings={"gen": 0.0, "run": 0.0, "eval": 0.0},
+                gen_stdout="",
+                gen_stderr="",
+                run_stdout="",
+                run_stderr="",
+                log_dir=agent.log_dir,
+                workspace_dir=agent.workspace_dir,
+            )
+            future = FakeFuture(result)
+            self.futures.append(future)
+            return future
+
+    agent_counter = {"value": 0}
+    observed_timeout: dict[str, float] = {}
+
+    def fake_agent(*args, **kwargs):
+        agent_counter["value"] += 1
+        idx = agent_counter["value"]
+        log_dir = tmp_path / f"log-{idx}"
+        workspace_dir = tmp_path / f"workspace-{idx}"
+        log_dir.mkdir()
+        workspace_dir.mkdir()
+        return SimpleNamespace(log_dir=log_dir, workspace_dir=workspace_dir)
+
+    def fake_as_completed(futures, timeout):
+        observed_timeout["value"] = timeout
+        yield futures[0]
+        raise TimeoutError
+
+    evals: list[EvalSpec] = [
+        {"name": "first", "files": {}, "run": "", "prompt": "", "expect": {}},
+        {"name": "second", "files": {}, "run": "", "prompt": "", "expect": {}},
+    ]
+    model_config = ModelConfig(model="fake/model", tool_format="markdown")
+
+    with (
+        patch("rig.eval.run.ProcessPoolExecutor", FakeExecutor),
+        patch("rig.eval.run.as_completed", side_effect=fake_as_completed),
+        patch("rig.eval.run.tqdm", side_effect=lambda iterable, **kwargs: iterable),
+        patch("rig.eval.run.GPTMe", side_effect=fake_agent),
+        patch("rig.eval.run.is_claude_code_model", return_value=False),
+        patch("rig.eval.run.load_pass_rate_data", return_value=None),
+        patch(
+            "rig.eval.run.apply_gate",
+            side_effect=lambda model, eval_name, no_lessons, data: (
+                no_lessons,
+                "default",
+            ),
+        ),
+        patch("rig.eval.run.multiprocessing.active_children", return_value=[]),
+    ):
+        results = run_evals(
+            evals=evals,
+            model_configs=[model_config],
+            timeout=1,
+            parallel=2,
+        )
+
+    model_results = results[model_config]
+    assert observed_timeout["value"] == 11
+    assert [result.name for result in model_results] == ["first", "second"]
+    assert [result.status for result in model_results] == ["success", "timeout"]
+    assert model_results[1].gen_stderr == "Process-level CancelledError"
+
+
+def test_write_results_includes_token_columns(tmp_path):
+    """write_results stores token metrics in CSV; read_results_from_csv restores them."""
+    from rig.eval.main import read_results_from_csv, write_results
+
+    config = ModelConfig(model="test-model", tool_format="tool")
+    results = [
+        EvalResult(
+            name="hello",
+            status="success",
+            results=[CaseResult(name="ok", passed=True, duration=0.1)],
+            timings={"gen": 2.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="gen out",
+            gen_stderr="",
+            run_stdout="run out",
+            run_stderr="",
+            log_dir=tmp_path / "log",
+            workspace_dir=tmp_path / "ws",
+            tokens_input=1200,
+            tokens_output=400,
+            cost_usd=0.008,
+            cache_read_tokens=600,
+            cache_creation_tokens=150,
+            cache_hit_rate=0.50,
+            num_steps=3,
+        ),
+    ]
+
+    import os
+
+    old_env = os.environ.get("EVAL_RESULTS_DIR")
+    os.environ["EVAL_RESULTS_DIR"] = str(tmp_path)
+    try:
+        write_results({config: results})
+    finally:
+        if old_env is None:
+            os.environ.pop("EVAL_RESULTS_DIR", None)
+        else:
+            os.environ["EVAL_RESULTS_DIR"] = old_env
+
+    # Find the written CSV
+    csv_files = list(tmp_path.rglob("eval_results.csv"))
+    assert len(csv_files) == 1, f"Expected one CSV, got {csv_files}"
+
+    restored = read_results_from_csv(str(csv_files[0]))
+    assert len(restored) == 1
+    (restored_config, restored_results) = next(iter(restored.items()))
+    assert restored_config == config
+    r = restored_results[0]
+    assert r.tokens_input == 1200
+    assert r.tokens_output == 400
+    assert r.tokens_total == 1600
+    assert r.cost_usd == 0.008
+    assert r.cache_read_tokens == 600
+    assert r.cache_creation_tokens == 150
+    assert r.cache_hit_rate == 0.50
+    assert r.num_steps == 3
+
+
+def test_apply_adversarial_framing_prepends_text():
+    """Adversarial framing prepends scenario text to the original prompt."""
+    from rig.eval.run import _apply_adversarial_framing
+
+    prompt = "Fix the bug in records.py"
+    framed = _apply_adversarial_framing("fix-mutable-default", prompt)
+    assert framed != prompt
+    assert prompt in framed
+    assert "Task:" in framed
+
+
+def test_apply_adversarial_framing_is_deterministic():
+    """Same test name always yields the same scenario."""
+    from rig.eval.run import _apply_adversarial_framing
+
+    prompt = "Refactor the code"
+    framed1 = _apply_adversarial_framing("git-selective-commit", prompt)
+    framed2 = _apply_adversarial_framing("git-selective-commit", prompt)
+    assert framed1 == framed2
+
+
+def test_apply_adversarial_framing_varies_by_test_name():
+    """Different test names can yield different scenarios."""
+    from rig.eval.run import _apply_adversarial_framing
+
+    prompt = "Write tests"
+    framed1 = _apply_adversarial_framing("write-test-suite", prompt)
+    framed2 = _apply_adversarial_framing("add-logging", prompt)
+    # Different test names *may* map to different scenarios (hash-based)
+    # We only assert they are not identical when the hashes differ
+    import hashlib
+
+    from rig.eval.run import _ADVERSARIAL_SCENARIOS
+
+    n = len(_ADVERSARIAL_SCENARIOS)
+    idx1 = int(hashlib.md5(b"write-test-suite").hexdigest(), 16) % n
+    idx2 = int(hashlib.md5(b"add-logging").hexdigest(), 16) % n
+    if idx1 != idx2:
+        assert framed1 != framed2

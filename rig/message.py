@@ -1,0 +1,686 @@
+import dataclasses
+import json
+import logging
+import re
+import shutil
+import sys
+import textwrap
+from collections.abc import Iterable
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Literal, TypedDict
+from xml.sax.saxutils import escape as xml_escape
+from xml.sax.saxutils import quoteattr
+
+import tomlkit
+from dateutil.parser import isoparse
+from rich.markup import escape as escape_markup
+from rich.syntax import Syntax
+from tomlkit._utils import escape_string
+from typing_extensions import Self
+
+from .codeblock import Codeblock
+from .constants import ROLE_COLOR
+from .util import console
+from .util.prompt import rich_to_str
+from .util.tokens import len_tokens
+from .util.uri import URI, FilePath, parse_file_reference
+
+logger = logging.getLogger(__name__)
+
+
+# Per-context output format. Defaults to "text".
+# Using ContextVar makes this thread-local: each thread (including subagent threads)
+# gets its own copy, so a subagent can set "quiet" without affecting the parent thread.
+# Set to "json" via set_output_format() to emit line-delimited JSON to stdout.
+# Set to "quiet" to suppress all terminal output (used by thread-mode subagents).
+_output_format: ContextVar[str] = ContextVar("_output_format", default="text")
+
+#: Valid output format identifiers.
+_VALID_OUTPUT_FORMATS = ("text", "json", "quiet")
+
+
+def set_output_format(fmt: str) -> None:
+    """Set the output format for print_msg and related rendering.
+
+    Args:
+        fmt: "text" for Rich-formatted output (default), "json" for JSONL stdout,
+             "quiet" to suppress all terminal output (used by thread-mode subagents).
+    """
+    assert fmt in _VALID_OUTPUT_FORMATS, f"Invalid output format: {fmt}"
+    _output_format.set(fmt)
+
+
+def get_output_format() -> str:
+    """Return the current output format ("text", "json", or "quiet")."""
+    return _output_format.get()
+
+
+def is_output_json() -> bool:
+    """Return True if the output format is set to JSON (JSONL stdout mode)."""
+    return _output_format.get() == "json"
+
+
+def is_output_quiet() -> bool:
+    """Return True if output is suppressed (quiet mode, used by subagent threads)."""
+    return _output_format.get() == "quiet"
+
+
+class UsageData(TypedDict, total=False):
+    """Token usage data from LLM API responses.
+
+    Nested under ``usage`` in :class:`MessageMetadata` to mirror the structure
+    returned by LLM provider APIs (Anthropic, OpenAI, etc.).
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+
+
+class ArtifactDescriptor(TypedDict, total=False):
+    """A tool/plugin-emitted artifact descriptor (see ErikBjare/bob#830).
+
+    Phase 2 of the webui artifact surface: tools attach these to a message's
+    metadata so the server can surface artifacts via typed declarations instead
+    of filename heuristics. Only ``source_type`` plus one of ``path``/``url`` is
+    required; the server fills in id, timestamps, preview hint, and actions.
+    """
+
+    source_type: Literal["attachment", "workspace", "external", "inline"]
+    path: str  # logdir-relative (attachment) or workspace path
+    url: str  # external URL (external sources)
+    kind: str  # optional kind override; server classifies when absent
+    title: str  # optional human-readable title; defaults to basename/url
+    mime_type: str  # optional MIME type
+    tool: str  # producing tool name (provenance)
+
+
+class MessageMetadata(TypedDict, total=False):
+    """
+    Metadata stored with each message.
+
+    All fields are optional for compact storage - only non-None values are serialized.
+
+    Token/cost fields are populated for assistant messages when telemetry is enabled.
+
+    Token counts are nested under ``usage`` to match LLM API response structure::
+
+        {
+            "model": "claude-sonnet",
+            "cost": 0.005,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_tokens": 80,
+                "cache_creation_tokens": 10,
+            }
+        }
+    """
+
+    model: str
+    cost: float  # Cost in USD
+    usage: UsageData
+    voice_call: dict[str, Any]  # Voice call metadata (call_sid, source, etc.)
+    artifacts: list[ArtifactDescriptor]  # tool/plugin-emitted artifact descriptors
+
+
+_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+)
+
+
+def _migrate_metadata(meta: dict) -> MessageMetadata:
+    """Migrate flat token format to nested ``usage`` format.
+
+    Old format had token fields at the top level alongside ``model`` and ``cost``.
+    New format nests them under ``usage``.  This function detects the old format
+    and converts it, allowing transparent deserialization of old logs.
+    """
+    # Already migrated (or new format)
+    if "usage" in meta or not any(k in meta for k in _TOKEN_KEYS):
+        return MessageMetadata(**meta)
+
+    usage: dict[str, int] = {}
+    remaining: dict = {}
+    for k, v in meta.items():
+        if k in _TOKEN_KEYS:
+            usage[k] = v
+        else:
+            remaining[k] = v
+    if usage:
+        remaining["usage"] = usage
+    return MessageMetadata(**remaining)
+
+
+def _format_toml_value(value: object) -> str:
+    """Format a value for TOML inline table, properly escaping strings."""
+    if isinstance(value, str):
+        return f'"{escape_string(value)}"'
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def _format_toml_inline_table(d: dict) -> str:
+    """Format a dict as a TOML inline table, recursing into nested dicts/lists."""
+    items = [f'"{k}" = {_format_toml_member(v)}' for k, v in d.items()]
+    return f"{{ {', '.join(items)} }}"
+
+
+def _format_toml_array(lst: list) -> str:
+    """Format a list as a TOML array, recursing into nested dicts/lists."""
+    return f"[{', '.join(_format_toml_member(v) for v in lst)}]"
+
+
+def _format_toml_member(value: object) -> str:
+    """Format any metadata member (scalar, dict, or list) for TOML."""
+    if isinstance(value, dict):
+        return _format_toml_inline_table(value)
+    if isinstance(value, list):
+        return _format_toml_array(value)
+    return _format_toml_value(value)
+
+
+def _format_metadata_toml(metadata: MessageMetadata) -> str:
+    """Format metadata as a TOML inline table.
+
+    Handles scalars, nested dicts (e.g. ``usage``), and lists of inline tables
+    (e.g. ``artifacts``) so all metadata round-trips through hand-editing.
+    """
+    meta_items = [f'"{k}" = {_format_toml_member(v)}' for k, v in metadata.items()]
+    return f"metadata = {{ {', '.join(meta_items)} }}"
+
+
+@dataclass(frozen=True, eq=False)
+class Message:
+    """
+    A message in the assistant conversation.
+
+    Attributes:
+        role: The role of the message sender (system, user, or assistant).
+        content: The content of the message.
+        timestamp: The timestamp of the message.
+        files: Files attached to the message, could e.g. be images for vision.
+        pinned: Whether this message should be pinned to the top of the chat, and never context-trimmed.
+        hide: Whether this message should be hidden from the chat output (but still be sent to the assistant).
+        quiet: Whether this message should be printed on execution (will still print on resume, unlike hide).
+               This is not persisted to the log file.
+        metadata: Optional metadata including token usage and cost information.
+    """
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    files: list[FilePath] = field(default_factory=list)
+    file_hashes: dict[str, str] = field(default_factory=dict)  # {filepath: hash}
+    call_id: str | None = None
+
+    pinned: bool = False
+    hide: bool = False
+    quiet: bool = False
+    # Number of later assistant turns after which this message is pruned from context.
+    # None means the message is never automatically pruned.
+    # ephemeral_ttl=2 means: keep for 2 more assistant turns, then drop from prepare_messages().
+    ephemeral_ttl: int | None = None
+
+    # Metadata for token usage and cost tracking
+    metadata: MessageMetadata | None = None
+
+    def __post_init__(self):
+        assert isinstance(self.timestamp, datetime)
+
+    def __repr__(self):
+        content = textwrap.shorten(self.content, 20, placeholder="...")
+        return f"<Message role={self.role} content={content}>"
+
+    def __eq__(self, other):
+        if not isinstance(other, Message):
+            return False
+        return self.role == other.role and self.content == other.content
+
+    def concat(self, other: "Message", separator: str = "\n\n") -> "Message":
+        """Concatenate two messages of the same role.
+
+        Merges content with separator, and combines files and file_hashes.
+        Preserves timestamp from the first message.
+
+        Args:
+            other: Message to concatenate with this one
+            separator: String to join content with (default: "\\n\\n")
+
+        Returns:
+            New Message with merged content and files
+
+        Raises:
+            ValueError: If messages have different roles
+        """
+        if self.role != other.role:
+            raise ValueError(
+                f"Cannot concatenate messages with different roles: {self.role} vs {other.role}"
+            )
+
+        # Merge file_hashes (other's hashes take precedence for same paths)
+        merged_hashes = {**self.file_hashes, **other.file_hashes}
+
+        # Use the shorter TTL when concatenating (the message expires sooner)
+        ttls = [t for t in (self.ephemeral_ttl, other.ephemeral_ttl) if t is not None]
+        merged_ttl = min(ttls) if ttls else None
+
+        return self.replace(
+            content=f"{self.content}{separator}{other.content}",
+            files=self.files + other.files,
+            file_hashes=merged_hashes,
+            # Keep pinned/hide/quiet if either message has it set
+            pinned=self.pinned or other.pinned,
+            hide=self.hide or other.hide,
+            quiet=self.quiet or other.quiet,
+            ephemeral_ttl=merged_ttl,
+        )
+
+    def __hash__(self):
+        return hash((self.role, self.content))
+
+    def len_tokens(self, model: str) -> int:
+        return len_tokens(self, model=model)
+
+    def replace(self, **kwargs) -> Self:
+        """Replace attributes of the message."""
+        return dataclasses.replace(self, **kwargs)
+
+    def to_dict(self, keys=None) -> dict:
+        """Return a dict representation of the message, serializable to JSON."""
+
+        d: dict = {
+            "role": self.role,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat(),
+        }
+        if self.files:
+            # Resolve Paths to absolute paths, keep URIs as-is
+            d["files"] = [
+                str(f) if isinstance(f, URI) else str(f.resolve()) for f in self.files
+            ]
+        if self.file_hashes:
+            d["file_hashes"] = self.file_hashes
+        if self.pinned:
+            d["pinned"] = True
+        if self.hide:
+            d["hide"] = True
+        if self.ephemeral_ttl is not None:
+            d["ephemeral_ttl"] = self.ephemeral_ttl
+        if self.call_id:
+            d["call_id"] = self.call_id
+        # Only serialize metadata if it has content (compact storage)
+        if self.metadata:
+            meta_dict = dict(self.metadata)
+            # Ensure nested usage dict is also a plain dict (not tomlkit types)
+            usage = meta_dict.get("usage")
+            if isinstance(usage, dict):
+                meta_dict["usage"] = dict(usage)
+            d["metadata"] = meta_dict
+        if keys:
+            return {k: d[k] for k in keys if k in d}
+        return d
+
+    def to_xml(self) -> str:
+        """Converts a message to an XML string with proper escaping."""
+        # Use quoteattr for role to handle quotes and special chars safely
+        # Use xml_escape for content to handle <, >, & characters
+        return f"<message role={quoteattr(self.role)}>\n{xml_escape(self.content)}\n</message>"
+
+    def format(
+        self,
+        oneline: bool = False,
+        highlight: bool = False,
+        max_length: int | None = None,
+    ) -> str:
+        """Format the message for display.
+
+        Args:
+            oneline: Whether to format the message as a single line
+            highlight: Whether to highlight code blocks
+            max_length: Maximum length of the message. If None, no truncation is applied.
+                       If set, will truncate at first newline or max_length, whichever comes first.
+        """
+        if max_length is not None:
+            first_newline = self.content.find("\n")
+            max_length = (
+                min(max_length, first_newline) if first_newline != -1 else max_length
+            )
+            content = self.content[:max_length]
+            if len(content) < len(self.content):
+                content += "..."
+            temp_msg = self.replace(content=content)
+            return format_msgs([temp_msg], oneline=True, highlight=highlight)[0]
+        return format_msgs([self], oneline=oneline, highlight=highlight)[0]
+
+    def print(self, oneline: bool = False, highlight: bool = True) -> None:
+        print_msg(self, oneline=oneline, highlight=highlight)
+
+    def to_toml(self) -> str:
+        """Converts a message to a TOML string, for easy editing by hand in editor to then be parsed back."""
+        flags = []
+        if self.pinned:
+            flags.append("pinned")
+        if self.hide:
+            flags.append("hide")
+        flags_toml = "\n".join(f"{flag} = true" for flag in flags)
+        if self.ephemeral_ttl is not None:
+            sep = "\n" if flags_toml else ""
+            flags_toml += f"{sep}ephemeral_ttl = {self.ephemeral_ttl}"
+        # Use proper TOML array syntax with escaped strings (not Python repr)
+        if self.files:
+            escaped_files = ", ".join(f'"{escape_string(str(f))}"' for f in self.files)
+            files_toml = f"files = [{escaped_files}]"
+        else:
+            files_toml = ""
+        # Serialize file_hashes as TOML inline table with proper escaping
+        if self.file_hashes:
+            items = ", ".join(
+                f'"{escape_string(k)}" = "{escape_string(v)}"'
+                for k, v in self.file_hashes.items()
+            )
+            file_hashes_toml = f"file_hashes = {{ {items} }}"
+        else:
+            file_hashes_toml = ""
+        # Serialize metadata as TOML inline table if present
+        if self.metadata:
+            metadata_toml = _format_metadata_toml(self.metadata)
+        else:
+            metadata_toml = ""
+        # Serialize call_id only if present (avoid serializing "None" as string)
+        call_id_toml = f'call_id = "{self.call_id}"' if self.call_id else ""
+        extra = (
+            flags_toml
+            + "\n"
+            + files_toml
+            + "\n"
+            + file_hashes_toml
+            + "\n"
+            + metadata_toml
+            + "\n"
+            + call_id_toml
+        ).strip()
+
+        # doublequotes need to be escaped
+        # content = self.content.replace('"', '\\"')
+        content = escape_string(self.content)
+        content = content.replace("\\n", "\n")
+        # Don't strip - preserve whitespace for data integrity
+
+        return f'''[message]
+role = "{self.role}"
+content = """
+{content}
+"""
+timestamp = "{self.timestamp.isoformat()}"
+{extra}
+'''
+
+    @classmethod
+    def from_toml(cls, toml: str) -> Self:
+        """
+        Converts a TOML string to a message.
+
+        The string can be a single [[message]].
+        """
+
+        t = tomlkit.parse(toml)
+        assert "message" in t and isinstance(t["message"], dict)
+        msg: dict = t["message"]
+
+        # Parse metadata if present (migrate old flat format if needed)
+        metadata: MessageMetadata | None = None
+        if msg.get("metadata"):
+            metadata = _migrate_metadata(dict(msg["metadata"]))
+
+        return cls(
+            msg["role"],
+            _fix_toml_content(msg["content"]),
+            pinned=msg.get("pinned", False),
+            hide=msg.get("hide", False),
+            ephemeral_ttl=msg.get("ephemeral_ttl"),
+            files=[parse_file_reference(f) for f in msg.get("files", [])],
+            file_hashes=msg.get("file_hashes", {}),
+            timestamp=isoparse(msg["timestamp"]),
+            call_id=msg.get("call_id"),
+            metadata=metadata,
+        )
+
+    def get_codeblocks(self) -> list[Codeblock]:
+        """
+        Get all codeblocks from the message content.
+        """
+        content_str = self.content
+
+        # prepend newline to make sure we get the first codeblock
+        if not content_str.startswith("\n"):
+            content_str = "\n" + content_str
+
+        # check if message contains a code block
+        backtick_count = content_str.count("\n```")
+        if backtick_count < 2:
+            return []
+
+        return Codeblock.iter_from_markdown(content_str)
+
+    def cost(self, model: str | None = None, output=False) -> float:
+        """Get the input cost of the message in USD."""
+        from .llm.models import get_default_model, get_model  # noreorder
+
+        m = get_model(model) if model else get_default_model()
+        assert m, "No model specified or loaded"
+        tok = len_tokens(self, f"{m.provider}/{m.model}")
+        price = (m.price_output if output else m.price_input) / 1_000_000
+        return tok * price
+
+
+def _strip_think_sig(content: str) -> str:
+    """Strip think-sig comments from message content.
+
+    Anthropic extended thinking signatures may be serialized into message
+    content as multiline comments. They are implementation noise the user
+    shouldn't see, while the surrounding thinking text can still be useful.
+    """
+    return re.sub(r"<!--\s*think-sig:.*?-->\s*", "", content, flags=re.DOTALL)
+
+
+def format_msgs(
+    msgs: list[Message],
+    oneline: bool = False,
+    highlight: bool = False,
+    indent: int = 0,
+) -> list[str]:
+    """Formats messages for printing to the console."""
+    # Import here to avoid circular import
+    from .config import get_config
+
+    outputs = []
+    for msg in msgs:
+        # Use configured username for user messages, otherwise capitalize the role
+        if msg.role == "user":
+            userprefix = get_config().user.user.name
+        else:
+            userprefix = msg.role.capitalize()
+        if highlight:
+            color = ROLE_COLOR[msg.role]
+            userprefix = f"[bold {color}]{userprefix}[/bold {color}]"
+
+        # get terminal width
+        max_len = shutil.get_terminal_size().columns - len(userprefix)
+        stripped_content = _strip_think_sig(msg.content)
+        output = ""
+        if oneline:
+            content = stripped_content.replace("\n", "\\n")
+            if highlight:
+                content = escape_markup(content)
+            output += textwrap.shorten(content, width=max_len, placeholder="...")
+            if len(output) < 20:
+                output = content[:max_len] + "..."
+        else:
+            multiline = len(stripped_content.split("\n")) > 1
+            output += "\n" + indent * " " if multiline else ""
+            for i, block in enumerate(stripped_content.split("```")):
+                if i % 2 == 0:
+                    # Escape Rich markup in non-code-block content
+                    if highlight:
+                        block = escape_markup(block)
+                    output += textwrap.indent(block, prefix=indent * " ")
+                    continue
+                if highlight:
+                    lang = block.split("\n", 1)[0]
+                    content = block.split("\n", 1)[-1]
+                    fmt = "underline blue"
+                    block = f"[{fmt}]{lang}\n[/{fmt}]" + rich_to_str(
+                        Syntax(
+                            content.rstrip().replace("[", r"\["),
+                            lang,
+                        )
+                    )
+                output += f"```{block.rstrip()}\n```"
+
+        status_emoji = ""
+        if msg.role == "system":
+            first_line = msg.content.split("\n", 1)[0].lower()
+            first_three_words = first_line.split()[:3]
+            isSuccess = first_line.startswith(("saved", "appended")) or any(
+                word in ["success", "successfully"] for word in first_three_words
+            )
+            isError = first_line.startswith(("error", "failed"))
+            if isSuccess:
+                status_emoji = "✅ "
+            elif isError:
+                status_emoji = "❌ "
+
+        outputs.append(f"{userprefix}: {status_emoji}{output.rstrip()}")
+    return outputs
+
+
+def print_msg(
+    msg: Message | list[Message],
+    oneline: bool = False,
+    highlight: bool = True,
+    show_hidden: bool = False,
+) -> int:
+    """Prints the log to the console. Returns the number of messages shown."""
+    # Quiet mode: suppress terminal output (not JSON — JSON is the structured interface).
+    # Only skip if we're not in JSON mode.
+    if is_output_quiet() and not is_output_json():
+        return 0
+
+    # if not tty, force highlight=False (for tests and such)
+    if not sys.stdout.isatty():
+        highlight = False
+
+    msgs = msg if isinstance(msg, list) else [msg]
+
+    # JSON output mode: emit line-delimited dicts to stdout
+    if is_output_json():
+        shown = 0
+        for m in msgs:
+            if m.hide and not show_hidden:
+                continue
+            shown += 1
+            event: dict = {
+                "type": "message",
+                "role": m.role,
+                "content": m.content,
+                "timestamp": m.timestamp.isoformat(),
+            }
+            if m.files:
+                event["files"] = [
+                    str(f) if isinstance(f, URI) else str(f.resolve()) for f in m.files
+                ]
+            if m.call_id:
+                event["call_id"] = m.call_id
+            if m.metadata:
+                meta_dict = dict(m.metadata)
+                # Ensure nested usage dict is also a plain dict (not tomlkit types),
+                # same as to_dict() — avoids default=str garbling structured data.
+                usage = meta_dict.get("usage")
+                if isinstance(usage, dict):
+                    meta_dict["usage"] = dict(usage)
+                event["metadata"] = meta_dict
+            sys.stdout.write(json.dumps(event, default=str) + "\n")
+        sys.stdout.flush()
+        return shown
+
+    msgstrs = format_msgs(msgs, highlight=highlight, oneline=oneline)
+    skipped_hidden = 0
+    shown = 0
+    for m, s in zip(msgs, msgstrs):
+        if m.hide and not show_hidden:
+            skipped_hidden += 1
+            continue
+        try:
+            console.print(s)
+        except Exception:
+            # rich can throw errors, if so then print the raw message
+            logger.exception("Error printing message")
+            print(s)
+        shown += 1
+    if skipped_hidden:
+        console.print(
+            f"[dim]Skipped {skipped_hidden} hidden system messages (/log --hidden to show)[/]"
+        )
+    return shown
+
+
+def msgs_to_toml(msgs: Iterable[Message]) -> str:
+    """Converts a list of messages to a TOML string, for easy editing by hand in editor to then be parsed back."""
+    t = ""
+    for msg in msgs:
+        t += msg.to_toml().replace("[message]", "[[messages]]") + "\n\n"
+
+    return t
+
+
+def _fix_toml_content(content: str) -> str:
+    """
+    Remove exactly one trailing newline that TOML multiline format adds.
+
+    TOML multiline strings (using triple quotes) add a newline before the
+    closing delimiter. This function removes that artifact while preserving
+    all other whitespace.
+    """
+    content = content.removesuffix("\n")
+    return content
+
+
+def toml_to_msgs(toml: str) -> list[Message]:
+    """
+    Converts a TOML string to a list of messages.
+
+    The string can be a whole file with multiple [[messages]].
+    """
+    t = tomlkit.parse(toml)
+    assert "messages" in t and isinstance(t["messages"], list)
+    msgs: list[dict] = t["messages"]
+
+    return [
+        Message(
+            msg["role"],
+            _fix_toml_content(msg["content"]),
+            pinned=msg.get("pinned", False),
+            hide=msg.get("hide", False),
+            timestamp=isoparse(msg["timestamp"]),
+            files=[parse_file_reference(f) for f in msg.get("files", [])],
+            file_hashes=dict(msg.get("file_hashes", {})),
+            call_id=msg.get("call_id"),
+            metadata=_migrate_metadata(dict(msg["metadata"]))
+            if msg.get("metadata")
+            else None,
+        )
+        for msg in msgs
+    ]
+
+
+def msgs2dicts(msgs: list[Message]) -> list[dict]:
+    """Convert a list of Message objects to a list of dicts ready to pass to an LLM."""
+    return [msg.to_dict(keys=["role", "content", "files", "call_id"]) for msg in msgs]

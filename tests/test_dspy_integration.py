@@ -1,0 +1,225 @@
+"""
+Integration tests for DSPy prompt optimization.
+
+These tests verify integration with rig's existing evaluation framework.
+"""
+
+import argparse
+import importlib.util
+import tempfile
+from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+if importlib.util.find_spec("dspy") is None:
+    pytest.skip("DSPy not available", allow_module_level=True)
+
+# Try to import all DSPy components - skip gracefully if any fail
+try:
+    from rig.eval.dspy.cli import DEFAULT_MODEL  # fmt: skip
+    from rig.eval.dspy.experiments import (  # fmt: skip
+        OptimizationExperiment,
+        quick_prompt_test,
+    )
+    from rig.eval.dspy.prompt_optimizer import (
+        RigModule,  # fmt: skip
+        PromptDataset,  # fmt: skip
+        get_current_rig_prompt,  # fmt: skip
+    )
+    from rig.eval.dspy.tasks import (  # fmt: skip
+        get_prompt_optimization_tasks,
+        get_task_metadata,
+        get_tasks_by_focus_area,
+    )
+    from rig.eval.types import EvalSpec  # fmt: skip
+except ImportError as e:
+    pytest.skip(f"DSPy imports failed: {e}", allow_module_level=True)
+
+
+def test_dataset_creation():
+    """Test creating DSPy datasets from rig eval specs."""
+
+    # Sample eval specs similar to rig's format
+    eval_specs = cast(
+        list[EvalSpec],
+        [
+            {
+                "name": "test-task",
+                "files": {"hello.py": 'print("Hello")'},
+                "run": "python hello.py",
+                "prompt": "Create a hello world script",
+                "tools": ["save"],
+                "expect": {"correct_output": lambda ctx: "Hello" in ctx.stdout},
+            }
+        ],
+    )
+
+    dataset = PromptDataset(eval_specs)
+    assert len(dataset) == 1
+
+    examples = list(dataset)
+    assert len(examples) == 1
+
+    example = examples[0]
+    assert hasattr(example, "task_description")
+    assert hasattr(example, "context")
+    assert example.task_description == "Create a hello world script"
+    assert "hello.py" in example.context
+
+
+def test_dataset_limiting():
+    """Test dataset size limiting."""
+
+    eval_specs = cast(
+        list[EvalSpec],
+        [{"name": f"task-{i}", "prompt": f"Task {i}"} for i in range(10)],
+    )
+
+    # Test without limit
+    dataset_full = PromptDataset(eval_specs)
+    assert len(dataset_full) == 10
+
+    # Test with limit
+    dataset_limited = PromptDataset(eval_specs, limit=5)
+    assert len(dataset_limited) == 5
+
+
+@patch("rig.eval.dspy.prompt_optimizer.dspy")
+def test_rig_module_creation(mock_dspy):
+    """Test creating DSPy module wrapper for rig."""
+
+    prompt = "You are rig, a helpful assistant."
+    module = RigModule(prompt)
+
+    assert hasattr(module, "forward")
+
+
+def test_experiment_initialization():
+    """Test experiment setup and initialization."""
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        experiment = OptimizationExperiment(
+            name="test_experiment", output_dir=Path(tmp_dir), model="test-model"
+        )
+
+        assert experiment.name == "test_experiment"
+        assert experiment.model == "test-model"
+        assert experiment.output_dir == Path(tmp_dir)
+        assert "experiment_name" in experiment.results
+        assert experiment.results["experiment_name"] == "test_experiment"
+
+
+def test_prompt_comparison_structure():
+    """Test structure of prompt comparison functionality."""
+
+    prompts = {
+        "prompt1": "You are a helpful assistant.",
+        "prompt2": "You are an advanced AI assistant.",
+    }
+
+    # Mock the actual optimization to avoid expensive calls
+    with patch("rig.eval.dspy.experiments.PromptOptimizer") as mock_optimizer:
+        mock_instance = MagicMock()
+        mock_instance.compare_prompts.return_value = {
+            "prompt1": {"average_score": 0.7},
+            "prompt2": {"average_score": 0.8},
+        }
+        mock_optimizer.return_value = mock_instance
+
+        # Mock the tasks module to provide test data
+        with patch("rig.eval.dspy.tasks.get_prompt_optimization_tasks") as mock_tasks:
+            mock_tasks.return_value = [{"name": "test", "prompt": "test prompt"}]
+
+            result = quick_prompt_test(prompts, num_examples=2, model="test-model")
+
+            assert isinstance(result, dict)
+            assert "prompt1" in result
+            assert "prompt2" in result
+
+
+def test_task_focus_areas():
+    """Test that tasks properly define focus areas."""
+
+    all_tasks = get_prompt_optimization_tasks()
+
+    # Collect all focus areas using metadata
+    focus_areas: set[str] = set()
+    for task in all_tasks:
+        metadata = get_task_metadata(task["name"])
+        focus_areas.update(metadata.get("focus_areas", []))
+
+    assert len(focus_areas) > 0
+
+    # Test that we can filter by each focus area
+    for area in focus_areas:
+        filtered_tasks = get_tasks_by_focus_area(area)
+        assert len(filtered_tasks) > 0
+
+        # Verify all returned tasks actually have this focus area in metadata
+        for task in filtered_tasks:
+            metadata = get_task_metadata(task["name"])
+            assert area in metadata.get("focus_areas", [])
+
+
+def test_cli_commands_structure():
+    """Test that CLI commands are properly structured."""
+
+    # Test that main parser can be created
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+
+    # Test that we can add a command (without actually running it)
+    test_parser = subparsers.add_parser("test")
+    test_parser.add_argument("--model", default="test-model")
+
+    # Parse some test arguments
+    args = parser.parse_args(["test", "--model", "anthropic/claude-sonnet-4-20250514"])
+    assert args.model == "anthropic/claude-sonnet-4-20250514"
+
+
+def test_prompt_template_extraction():
+    """Test extracting prompts from rig's prompt system."""
+
+    # Test both interactive and non-interactive modes
+    interactive_prompt = get_current_rig_prompt(interactive=True, model=DEFAULT_MODEL)
+    non_interactive_prompt = get_current_rig_prompt(
+        interactive=False, model=DEFAULT_MODEL
+    )
+
+    assert isinstance(interactive_prompt, str)
+    assert isinstance(non_interactive_prompt, str)
+    assert len(interactive_prompt) > 0
+    assert len(non_interactive_prompt) > 0
+
+    # Interactive should mention user interaction
+    assert "interactive" in interactive_prompt.lower()
+    # Non-interactive should mention automatic execution
+    assert "non-interactive" in non_interactive_prompt.lower()
+
+
+def test_end_to_end_structure():
+    """Test the complete structure of an optimization workflow (without execution)."""
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Initialize experiment
+        experiment = OptimizationExperiment(
+            name="integration_test", output_dir=Path(tmp_dir), model="test-model"
+        )
+
+        # Verify experiment structure
+        assert experiment.name == "integration_test"
+        assert experiment.output_dir.exists()
+        assert "experiment_name" in experiment.results
+
+        # Test result saving structure
+        results_file = experiment.save_results()
+        assert results_file.exists()
+        assert results_file.suffix == ".json"
+
+        # Test report generation structure
+        report = experiment.generate_report()
+        assert isinstance(report, str)
+        assert "integration_test" in report
+        assert "Prompt Optimization Report" in report

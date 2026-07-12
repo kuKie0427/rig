@@ -1,0 +1,278 @@
+name: Test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+jobs:
+  # Detect which paths changed to skip expensive jobs on docs/config-only PRs
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      # Core Python code changed (any rig source, tests, or deps)
+      code: ${{ steps.filter.outputs.code }}
+      # LLM/API-related code changed (llm, acp, tools, agent, tests)
+      api-related: ${{ steps.filter.outputs.api-related }}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dorny/paths-filter@v4
+      id: filter
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        filters: |
+          code:
+            - 'rig/**'
+            - 'tests/**'
+            - 'poetry.lock'
+            - 'pyproject.toml'
+            - 'Makefile'
+            - '.github/workflows/test.yml'
+          api-related:
+            - 'rig/llm/**'
+            - 'rig/acp/**'
+            - 'rig/tools/**'
+            - 'rig/agent/**'
+            - 'rig/eval/**'
+            - 'rig/chat.py'
+            - 'rig/codeblock.py'
+            - 'rig/message.py'
+            - 'rig/prompts.py'
+            - 'rig/session.py'
+            - 'rig/executor.py'
+            - 'tests/**'
+            - 'poetry.lock'
+            - 'Makefile'
+            - '.github/workflows/test.yml'
+
+  # Core tests: no API keys needed, runs all tests except requires_api/eval
+  # Also includes slow tests (browser, MCP, integration, etc.) since they don't need API
+  test-no-api:
+    needs: changes
+    # Always run on push to master; on PRs, only when code changed
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    name: Test without API keys
+    runs-on: ubuntu-latest
+    env:
+      RELEASE: false
+      # Explicitly unset API keys to test without them
+      OPENAI_API_KEY: ''
+      ANTHROPIC_API_KEY: ''
+      DEEPSEEK_API_KEY: ''
+      OPENROUTER_API_KEY: ''
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Install apt dependencies
+      run: sudo apt-get install universal-ctags pandoc tmux x11-xserver-utils xvfb xdotool scrot xterm fluxbox imagemagick
+
+    - name: Set up Xvfb
+      run: |
+        Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+        echo "DISPLAY=:99" >> $GITHUB_ENV
+
+    - name: Store cache ID in file .cache-id
+      id: cache-id
+      run: echo "noextras" > .cache-id
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+        cache: 'poetry'
+        cache-dependency-path: |
+          poetry.lock
+          .cache-id
+
+    - name: Install dependencies
+      run: |
+        make build
+        poetry install -E all
+
+    - name: Install playwright
+      run: poetry run playwright install chromium
+
+    - name: Run tests (without API keys, including slow)
+      env:
+        TERM: xterm
+        MODEL: local/test
+      run: make test SLOW=true
+
+    - name: Upload coverage reports to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: no-api
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        report_type: test_results
+
+  # Minimal install test: no extras, tests the most common user installation config
+  test-minimal:
+    needs: changes
+    # Always run on push to master; on PRs, only when code changed
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    name: Test without API keys or extras
+    runs-on: ubuntu-latest
+    env:
+      RELEASE: false
+      OPENAI_API_KEY: ''
+      ANTHROPIC_API_KEY: ''
+      DEEPSEEK_API_KEY: ''
+      OPENROUTER_API_KEY: ''
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Install apt dependencies
+      run: sudo apt-get install universal-ctags pandoc tmux x11-xserver-utils xvfb
+
+    - name: Set up Xvfb
+      run: |
+        Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+        echo "DISPLAY=:99" >> $GITHUB_ENV
+
+    - name: Store cache ID in file .cache-id
+      id: cache-id
+      run: echo "minimal" > .cache-id
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        cache: 'poetry'
+        cache-dependency-path: |
+          poetry.lock
+          .cache-id
+
+    - name: Install dependencies (no extras)
+      run: |
+        make build
+        poetry install
+
+    - name: Run tests (no extras, fast only)
+      env:
+        TERM: xterm
+        MODEL: local/test
+      run: make test
+
+    - name: Upload coverage reports to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: no-api,no-extras
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        report_type: test_results
+
+  # API tests: only run requires_api tests, across multiple cheap models
+  # Skipped on docs/config-only PRs to reduce API spend (~$30+/day in Haiku costs)
+  # Note: Anthropic tests route through OpenRouter (OPENROUTER_API_KEY) for cost controls
+  test-api:
+    needs: changes
+    # Run on push to master, or on PRs when API-related code changed (and not a fork)
+    if: |
+      (github.event_name == 'push') ||
+      (needs.changes.outputs.api-related == 'true' &&
+       (github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'))
+    name: API tests with ${{ matrix.model }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE: false
+      # OpenRouter can treat omitted max_tokens as the model's full output ceiling,
+      # which is wasteful and can exceed the CI account's credit budget.
+      RIG_MAX_TOKENS: "8192"
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: 'openai/gpt-4o-mini'
+          - model: 'openrouter/anthropic/claude-haiku-4-5'
+          # - model: 'openrouter/minimax/minimax-m2.5'  # disabled: too brittle (SSL errors, inconsistent stop reasons)
+          #   experimental: true
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Install apt dependencies
+      run: sudo apt-get install universal-ctags pandoc tmux x11-xserver-utils xvfb
+
+    - name: Set up Xvfb
+      run: |
+        Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+        echo "DISPLAY=:99" >> $GITHUB_ENV
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        cache: 'poetry'
+        cache-dependency-path: poetry.lock
+
+    - name: Install dependencies
+      run: |
+        make build
+        poetry install -E all
+
+    - name: Install playwright
+      run: poetry run playwright install chromium
+
+    - name: Run API tests only
+      uses: nick-fields/retry@v4
+      env:
+        TERM: xterm
+        MODEL: ${{ matrix.model }}
+      with:
+        timeout_minutes: 15
+        max_attempts: 1  # favor pytest retries (mark with flaky)
+        retry_wait_seconds: 10
+        command: make test-api
+
+    - name: Upload coverage reports to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      env:
+        MODEL: ${{ matrix.model }}
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        env_vars: MODEL
+        flags: ${{ matrix.model }}
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        report_type: test_results

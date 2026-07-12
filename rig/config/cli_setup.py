@@ -1,0 +1,287 @@
+"""CLI configuration setup.
+
+Handles initialization of configuration from CLI arguments,
+resolving precedence between CLI args, saved configs, env vars, and defaults.
+"""
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from ..gears import parse_gear, resolve_gear
+from ..profiles import get_profile
+from ..tools import get_toolchain
+from .chat import ChatConfig
+from .core import Config, get_config, set_config, set_config_from_workspace
+
+if TYPE_CHECKING:
+    from ..tools.base import ToolFormat
+
+logger = logging.getLogger(__name__)
+
+
+def _get_model_default_tool_format(model: str | None) -> str | None:
+    """Get the model's preferred tool format, if any.
+
+    Returns the default_tool_format from ModelMeta, or None if not set."""
+    if not model:
+        return None
+    try:
+        from ..llm.models import get_model
+
+        meta = get_model(model)
+        return meta.default_tool_format
+    except (ImportError, KeyError, ValueError, AttributeError):
+        return None
+
+
+def _is_tool_file_path(value: str) -> bool:
+    return (
+        value.endswith(".py")
+        or value.startswith(("/", "./", "../", "~"))
+        or (
+            len(value) > 2 and value[1] == ":" and value[2] in "/\\"  # Windows C:\...
+        )
+    )
+
+
+def _normalize_tool_allowlist(allowlist: list[str] | None) -> list[str] | None:
+    """Normalize an allowlist while preserving custom tool file paths.
+
+    ``get_toolchain()`` validates and expands named tools, but custom tool files
+    are loaded later by ``init_tools()`` and must remain as file paths.
+    """
+    if allowlist is None:
+        return None
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in allowlist:
+        if _is_tool_file_path(item):
+            resolved = Path(item).expanduser().resolve()
+            if not resolved.exists():
+                raise ValueError(f"Tool file does not exist: {item}")
+            if not resolved.is_file():
+                raise ValueError(f"Tool path is not a file: {item}")
+            if resolved.suffix != ".py":
+                raise ValueError(f"Tool file must be a .py file: {item}")
+            normalized_item = str(resolved)
+            if normalized_item not in seen:
+                normalized.append(normalized_item)
+                seen.add(normalized_item)
+            continue
+
+        for tool in get_toolchain([item]):
+            if tool.name in seen:
+                continue
+            normalized.append(tool.name)
+            seen.add(tool.name)
+
+    return normalized
+
+
+def setup_config_from_cli(
+    workspace: Path,
+    logdir: Path,
+    model: str | None = None,
+    tool_allowlist: str | None = None,
+    tool_format: "ToolFormat | None" = None,
+    prune_tool_output: bool | None = None,
+    gear: int | None = None,
+    no_confirm: bool | None = None,
+    stream: bool = True,
+    interactive: bool = True,
+    agent_path: Path | None = None,
+) -> Config:
+    """
+    Initialize and return a complete config from CLI arguments and workspace.
+
+    Handles the precedence: CLI args -> saved conversation config -> env vars -> config files -> defaults
+    """
+
+    # Load base config from workspace
+    set_config_from_workspace(workspace)
+    config = get_config()
+
+    # Check if we're resuming an existing conversation
+    existing_chat_config = None
+    if logdir.exists() and (logdir / "config.toml").exists():
+        existing_chat_config = ChatConfig.from_logdir(logdir)
+
+    # Resolve configuration values with proper precedence
+    # For resuming: CLI args -> saved conversation config -> env vars/config files
+    # For new conversations: CLI args -> env vars/config files -> defaults
+    resolved_model: str | None
+    if model is not None:
+        # CLI override always takes precedence
+        resolved_model = model
+    elif existing_chat_config and existing_chat_config.model:
+        # When resuming, use saved conversation model unless CLI override provided
+        resolved_model = existing_chat_config.model
+    else:
+        # Fall back to env/config for new conversations or when no saved model
+        resolved_model = config.get_env("MODEL")
+
+    resolved_gear = parse_gear(gear)
+    if (
+        resolved_gear is None
+        and existing_chat_config
+        and existing_chat_config.gear is not None
+    ):
+        resolved_gear = parse_gear(existing_chat_config.gear)
+    if resolved_gear is None:
+        settings_gear = (
+            config.project.settings.gear
+            if config.project and config.project.settings.gear is not None
+            else config.user.settings.gear
+        )
+        resolved_gear = parse_gear(settings_gear)
+
+    gear_profile_name: str | None = None
+    gear_tool_allowlist: tuple[str, ...] | None = None
+    gear_no_confirm: bool | None = None
+    if resolved_gear is not None:
+        gear_resolution = resolve_gear(resolved_gear)
+        gear_profile_name = gear_resolution.profile_name
+        gear_tool_allowlist = gear_resolution.tool_allowlist
+        gear_no_confirm = gear_resolution.no_confirm
+
+    # Handle tool allowlist with similar precedence
+    resolved_tool_allowlist: list[str] | None = None
+    if tool_allowlist is not None:
+        # Check for additive syntax (starts with '+')
+        if tool_allowlist.startswith("+"):
+            # Strip the '+' prefix and parse the additional tools
+            tool_list_str = tool_allowlist[1:]
+            additional_tools = [
+                tool.strip() for tool in tool_list_str.split(",") if tool.strip()
+            ]
+            # Get default tools and add the additional ones
+            default_tools = [tool.name for tool in get_toolchain(None)]
+            resolved_tool_allowlist = default_tools.copy()
+            for tool in additional_tools:
+                if tool not in resolved_tool_allowlist:
+                    resolved_tool_allowlist.append(tool)
+        elif tool_allowlist.startswith("-"):
+            # Exclusion syntax: start with defaults, remove specified tools
+            tool_list_str = tool_allowlist[1:]
+            excluded_tools = [
+                tool.strip() for tool in tool_list_str.split(",") if tool.strip()
+            ]
+            default_tools = [tool.name for tool in get_toolchain(None)]
+            non_default = [t for t in excluded_tools if t not in default_tools]
+            if non_default:
+                logger.warning(
+                    "Tool(s) %s are not in the default toolset and cannot be excluded",
+                    ", ".join(non_default),
+                )
+            resolved_tool_allowlist = [
+                tool for tool in default_tools if tool not in excluded_tools
+            ]
+        elif tool_allowlist == "":
+            # Explicitly empty: disable all tools (--tools none)
+            resolved_tool_allowlist = []
+        else:
+            # Normal mode - CLI override replaces defaults
+            resolved_tool_allowlist = [
+                tool.strip() for tool in tool_allowlist.split(",")
+            ]
+    elif gear_tool_allowlist is not None:
+        if gear_tool_allowlist and gear_tool_allowlist[0].startswith("+"):
+            default_tools = [tool.name for tool in get_toolchain(None)]
+            resolved_tool_allowlist = default_tools.copy()
+            for tool in (item.removeprefix("+") for item in gear_tool_allowlist):
+                if tool not in resolved_tool_allowlist:
+                    resolved_tool_allowlist.append(tool)
+        else:
+            resolved_tool_allowlist = list(gear_tool_allowlist)
+    elif existing_chat_config and existing_chat_config.tools:
+        # When resuming, use saved conversation tools unless CLI override provided
+        resolved_tool_allowlist = existing_chat_config.tools
+    elif tools_env := config.get_env("TOOL_ALLOWLIST"):
+        # Fall back to env/config for new conversations or when no saved tools
+        resolved_tool_allowlist = [tool.strip() for tool in tools_env.split(",")]
+
+    # Automatically add 'complete' tool in non-interactive mode
+    if not interactive:
+        if resolved_tool_allowlist is None:
+            # Get default tools and add complete to them
+            default_tools = [tool.name for tool in get_toolchain(None)]
+            resolved_tool_allowlist = default_tools
+            if "complete" not in resolved_tool_allowlist:
+                resolved_tool_allowlist.append("complete")
+        elif "complete" not in resolved_tool_allowlist:
+            resolved_tool_allowlist.append("complete")
+        logger.debug("Added 'complete' tool to allowlist for non-interactive mode")
+
+    # Handle tool_format with similar precedence
+    if tool_format is not None:
+        # CLI override always takes precedence
+        resolved_tool_format = tool_format
+    elif existing_chat_config and existing_chat_config.tool_format:
+        # When resuming, use saved conversation tool_format unless CLI override provided
+        resolved_tool_format = existing_chat_config.tool_format
+    else:
+        # Fall back to env/config, then model default, then "markdown"
+        env_tool_format = config.get_env("TOOL_FORMAT")
+        model_tool_format = _get_model_default_tool_format(resolved_model)
+        if env_tool_format:
+            resolved_tool_format = cast("ToolFormat", env_tool_format)
+        elif model_tool_format:
+            resolved_tool_format = cast("ToolFormat", model_tool_format)
+            logger.info(
+                "Using model default tool_format=%s for %s",
+                model_tool_format,
+                resolved_model,
+            )
+        else:
+            resolved_tool_format = "markdown"
+
+    resolved_no_confirm = gear_no_confirm if no_confirm is None else no_confirm
+
+    # Handle agent_path with similar precedence
+    if gear_profile_name and not agent_path:
+        gear_profile = get_profile(gear_profile_name)
+        if gear_profile and gear_profile.tools is not None and tool_allowlist is None:
+            resolved_tool_allowlist = list(gear_profile.tools)
+
+    resolved_agent_path: Path | None = agent_path
+    if agent_path is None and existing_chat_config and existing_chat_config.agent:
+        # When resuming, use saved conversation agent unless CLI override provided
+        resolved_agent_path = existing_chat_config.agent
+
+    # Create or load chat config with CLI overrides
+    logdir.mkdir(parents=True, exist_ok=True)
+    config.chat = ChatConfig.load_or_create(
+        logdir=logdir,
+        cli_config=ChatConfig(
+            model=resolved_model,
+            tool_format=resolved_tool_format,
+            gear=resolved_gear,
+            stream=stream,
+            interactive=interactive,
+            no_confirm=resolved_no_confirm,
+            workspace=workspace,
+            agent=resolved_agent_path,
+        ),
+    )
+
+    if prune_tool_output is not None:
+        config.chat.env = {
+            **config.chat.env,
+            "PRUNE_TOOL_OUTPUT": "1" if prune_tool_output else "0",
+        }
+
+    # Set tools if not already set or if CLI/gear override provided
+    if (
+        config.chat.tools is None
+        or tool_allowlist is not None
+        or gear_tool_allowlist is not None
+    ):
+        config.chat.tools = _normalize_tool_allowlist(resolved_tool_allowlist)
+
+    # Save and set the final config
+    config.chat.save()
+    set_config(config)
+    return config

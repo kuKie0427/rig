@@ -1,0 +1,266 @@
+import '@testing-library/jest-dom';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { observable } from '@legendapp/state';
+import { ChatInput } from '../ChatInput';
+
+const mockUploadFiles = jest.fn();
+const mockConversation$ = observable({
+  isGenerating: false,
+  executingTool: null,
+  chatConfig: { chat: {} },
+});
+
+jest.mock('@/contexts/SettingsContext', () => ({
+  useSettings: () => ({
+    settings: {
+      chimeEnabled: true,
+      blocksDefaultOpen: true,
+      showHiddenMessages: false,
+      showInitialSystem: false,
+      hasCompletedSetup: true,
+      welcomeBackground: '',
+      voiceServerUrl: '',
+    },
+    updateSettings: jest.fn(),
+    resetSettings: jest.fn(),
+  }),
+}));
+
+jest.mock('@/contexts/ApiContext', () => {
+  const { observable } = jest.requireActual('@legendapp/state');
+  return {
+    useApi: () => ({
+      api: {
+        uploadFiles: mockUploadFiles,
+      },
+      isConnected$: observable(true),
+      connectionConfig: { baseUrl: 'http://localhost:5700', authToken: null, useAuthToken: false },
+    }),
+  };
+});
+
+jest.mock('@/stores/sidebar', () => {
+  const { observable } = jest.requireActual('@legendapp/state');
+  return {
+    selectedAgent$: observable(null),
+    selectedWorkspace$: observable(null),
+    rightSidebarVisible$: observable(false),
+    rightSidebarActiveTab$: observable(null),
+  };
+});
+
+jest.mock('@/stores/conversations', () => {
+  return {
+    conversations$: {
+      get: jest.fn(() => mockConversation$),
+    },
+    setMaxTokens: jest.fn(),
+    setTemperature: jest.fn(),
+    setTopP: jest.fn(),
+  };
+});
+
+jest.mock('@/hooks/useModels', () => ({
+  useModels: () => ({
+    models: [],
+    defaultModel: '',
+    availableModels: [],
+    recommendedModels: [],
+    isLoading: false,
+    error: null,
+  }),
+}));
+
+jest.mock('@/hooks/useWorkspaces', () => ({
+  useWorkspaces: () => ({ workspaces: [], addCustomWorkspace: jest.fn() }),
+}));
+
+jest.mock('@/hooks/useFileAutocomplete', () => ({
+  useFileAutocomplete: () => ({
+    state: {
+      files: [],
+      selectedIndex: -1,
+      isOpen: false,
+      query: '',
+    },
+    handleInputChange: jest.fn(),
+    handleKeyDown: jest.fn(() => false),
+    selectFile: jest.fn(() => ''),
+    setSelectedIndex: jest.fn(),
+  }),
+}));
+
+jest.mock('@/components/ModelPicker', () => ({
+  ModelPicker: () => null,
+  ModelPickerField: () => null,
+}));
+
+jest.mock('@/hooks/useAgents', () => ({
+  useAgents: () => ({ agents: [], isLoading: false, error: null }),
+}));
+
+jest.mock('@/components/WorkspaceSelector', () => ({
+  WorkspaceSelector: () => null,
+}));
+
+jest.mock('@/components/FileAutocomplete', () => ({
+  FileAutocomplete: () => null,
+}));
+
+jest.mock('sonner', () => ({
+  toast: {
+    error: jest.fn(),
+  },
+}));
+
+describe('ChatInput', () => {
+  beforeEach(() => {
+    mockUploadFiles.mockReset();
+    mockUploadFiles.mockResolvedValue({
+      files: [
+        {
+          name: 'test.txt',
+          path: '/tmp/conv-a/attachments/test.txt',
+        },
+      ],
+    });
+    window.localStorage.clear();
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: {} },
+    });
+  });
+
+  it('clears attached files when the conversation changes', async () => {
+    const autoFocus$ = observable(false);
+    const onSend = jest.fn();
+
+    const { container, rerender } = render(
+      <ChatInput conversationId="conv-a" onSend={onSend} autoFocus$={autoFocus$} />
+    );
+
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    const file = new File(['hello world'], 'test.txt', { type: 'text/plain' });
+    fireEvent.change(fileInput!, { target: { files: [file] } });
+
+    // Files are buffered locally (not uploaded until send)
+    await waitFor(() => expect(screen.getByText('test.txt')).toBeInTheDocument());
+
+    rerender(<ChatInput conversationId="conv-b" onSend={onSend} autoFocus$={autoFocus$} />);
+
+    await waitFor(() => expect(screen.queryByText('test.txt')).not.toBeInTheDocument());
+  });
+
+  it('labels the composer and disables empty sends', async () => {
+    const autoFocus$ = observable(false);
+    const onSend = jest.fn();
+
+    render(<ChatInput conversationId="conv-a" onSend={onSend} autoFocus$={autoFocus$} />);
+
+    const input = screen.getByRole('textbox', { name: 'Chat message' });
+    expect(input).toHaveAccessibleDescription(/Press Enter to send/);
+
+    const sendButton = screen.getByRole('button', { name: 'Send message' });
+    expect(sendButton).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: 'ship the refresh' } });
+    expect(sendButton).toBeEnabled();
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        'ship the refresh',
+        expect.objectContaining({ stream: true, workspace: '.' })
+      );
+    });
+  });
+
+  it('keeps the stop action enabled while generating without text', () => {
+    const autoFocus$ = observable(false);
+    mockConversation$.set({
+      isGenerating: true,
+      executingTool: null,
+      chatConfig: { chat: {} },
+    });
+
+    render(
+      <ChatInput
+        conversationId="conv-a"
+        onSend={jest.fn()}
+        onInterrupt={jest.fn().mockResolvedValue(undefined)}
+        autoFocus$={autoFocus$}
+      />
+    );
+
+    const stopButton = screen.getByRole('button', { name: 'Stop generation' });
+    expect(stopButton).toBeEnabled();
+    expect(stopButton).toHaveTextContent('Stop');
+  });
+
+  it('focuses the textarea on mount when autoFocus$ is true and resets the observable', async () => {
+    // autoFocus$ must be reset to false after focusing so a stable observable
+    // (useObservable in WelcomeView) doesn't re-trigger focus on subsequent renders.
+    const autoFocus$ = observable(true);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    const textarea = screen.getByRole('textbox', { name: 'Chat message' });
+    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(autoFocus$.get()).toBe(false);
+  });
+
+  it('does not steal focus on re-render when autoFocus$ is false', () => {
+    // Regression guard for the WelcomeView focus-steal bug:
+    // before the fix, WelcomeView created a new observable(true) on every render,
+    // so each state change stole focus from open popups and settings inputs.
+    // With the fix (useObservable), the observable is stable and stays false after
+    // the initial focus, so subsequent re-renders must not move focus.
+    const autoFocus$ = observable(false);
+    const onSend = jest.fn();
+    const { rerender } = render(
+      <ChatInput conversationId="conv-a" onSend={onSend} autoFocus$={autoFocus$} />
+    );
+
+    const textarea = screen.getByRole('textbox', { name: 'Chat message' });
+    act(() => textarea.blur());
+    expect(document.activeElement).not.toBe(textarea);
+
+    rerender(<ChatInput conversationId="conv-a" onSend={onSend} autoFocus$={autoFocus$} />);
+    expect(document.activeElement).not.toBe(textarea);
+  });
+
+  it('preserves existing attachments in edit mode', async () => {
+    const autoFocus$ = observable(false);
+    const onEditSave = jest.fn();
+
+    const { rerender } = render(
+      <ChatInput
+        conversationId="conv-a"
+        autoFocus$={autoFocus$}
+        editMode
+        editFiles={['/tmp/conv-a/attachments/existing.txt']}
+        onEditSave={onEditSave}
+      />
+    );
+
+    expect(screen.getByText('existing.txt')).toBeInTheDocument();
+
+    rerender(
+      <ChatInput
+        conversationId="conv-b"
+        autoFocus$={autoFocus$}
+        editMode
+        editFiles={['/tmp/conv-b/attachments/new.txt']}
+        onEditSave={onEditSave}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('existing.txt')).not.toBeInTheDocument();
+      expect(screen.getByText('new.txt')).toBeInTheDocument();
+    });
+  });
+});

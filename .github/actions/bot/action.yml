@@ -1,0 +1,93 @@
+name: 'rig-bot'
+description: 'A composite action for the rig-bot workflow using the github_bot.py script'
+inputs:
+  openai_api_key:
+    description: 'OpenAI API Key'
+    required: false
+  anthropic_api_key:
+    description: 'Anthropic API Key'
+    required: false
+  model:
+    description: 'Model to use'
+    required: false
+    default: 'anthropic/claude-sonnet-4-6'
+  github_token:
+    description: 'GitHub Token'
+    required: true
+  allowlist:
+    description: 'Comma-separated list of GitHub usernames allowed to trigger the bot'
+    required: true
+    default: 'ErikBjare'
+  mode:
+    description: 'Bot mode: "comment" (default) or "resolve" (label-triggered issue resolution)'
+    required: false
+    default: 'comment'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install rig
+      shell: bash
+      run: |
+        pip install rig[server]
+
+    - name: Write rig config
+      shell: bash
+      run: |
+        mkdir -p ~/.config/rig
+        if [ "${{ inputs.mode }}" = "resolve" ]; then
+          cat > ~/.config/rig/config.toml << EOF
+        [prompt]
+        about_user = "You are the rig-bot operating in issue-resolver mode. You have been triggered by a label on a GitHub issue. Your task is to read the issue, understand what fix is needed, implement the changes, and create a draft PR."
+        response_preference = "Don't explain basic concepts. Focus on making the minimal correct fix."
+        EOF
+        else
+          cat > ~/.config/rig/config.toml << EOF
+        [prompt]
+        about_user = "The user is talking to the rig bot through GitHub comments. They have initiated conversation by pinging it with @rig, triggering a GitHub Action in which rig now runs."
+        response_preference = "Don't explain basic concepts"
+        EOF
+        fi
+
+    - name: Run GitHub Bot
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        MODEL: ${{ inputs.model }}
+        ALLOWLIST: ${{ inputs.allowlist }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+      run: |
+        # Prefer the local script when running inside the rig repo itself.
+        # Fall back to downloading a pinned version for use as a reusable external action.
+        # Pin to specific commit for supply chain security (248aac98).
+        # When bumping the pin, update SCRIPT_SHA256 to match the new commit's script.
+        SCRIPT_SHA256="331d70f7c3e77544a2a4d017e2e243324726a2043de39f73ff0e5ed0f6a7ca16"
+        if [ -f "scripts/github_bot.py" ]; then
+          cp scripts/github_bot.py /tmp/github_bot.py
+        else
+          SCRIPT_URL="https://raw.githubusercontent.com/rig/rig/248aac98c02113009837c4b582dd72ed0604dd63/scripts/github_bot.py"
+          curl -fsL "$SCRIPT_URL" > /tmp/github_bot.py
+          echo "${SCRIPT_SHA256}  /tmp/github_bot.py" | sha256sum -c -
+        fi
+        python /tmp/github_bot.py --mode "${{ inputs.mode }}" --workspace .
+
+    - name: Report error
+      if: failure() && env.RIG_BOT_HANDLED_FAILURE != '1'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        MESSAGE="I'm sorry, I could not fulfill your request. Please check the [log of this run]($RUN_URL) for more information."
+        echo "$MESSAGE" | gh issue comment ${{ github.event.issue.number }} -R ${{ github.repository }} --body-file=-

@@ -1,0 +1,675 @@
+"""
+OpenTelemetry implementation details for rig performance monitoring.
+
+This module contains the heavy OpenTelemetry imports and initialization logic,
+separated from the main telemetry module to avoid importing large dependencies
+unless explicitly needed.
+"""
+
+import importlib.util as _importlib_util
+import logging
+import os
+import socket
+import time
+from contextvars import ContextVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Span
+
+logger = logging.getLogger(__name__)
+
+# Context variables for conversation tracking
+# These propagate across async/threaded operations
+_conversation_id: ContextVar[str | None] = ContextVar("conversation_id", default=None)
+_session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
+
+
+class TelemetryConnectionErrorFilter(logging.Filter):
+    """Filter to debounce and truncate verbose network/export traces from OpenTelemetry.
+
+    This filter:
+    1. Simplifies verbose stack traces to single-line messages
+    2. Debounces repeated errors (shows first, then suppresses for cooldown period)
+    3. Periodically shows a count of suppressed errors
+
+    The filter ensures users see at least one error message when telemetry fails,
+    but prevents spam from repeated exporter network failures.
+    """
+
+    _NETWORK_ERROR_NAME_FRAGMENTS = (
+        "ConnectionError",
+        "NewConnectionError",
+        "MaxRetryError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "TimeoutError",
+    )
+
+    def __init__(self, cooldown_seconds: float = 300.0):
+        super().__init__()
+        self._error_counts: dict[str, int] = {}
+        self._last_logged: dict[str, float] = {}
+        self._cooldown_seconds = cooldown_seconds  # 5 minutes between repeated errors
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Filter and debounce connection error messages.
+
+        Returns True to allow the (possibly modified) record through.
+        Returns False to suppress duplicate errors within cooldown period.
+        """
+        # Only filter opentelemetry loggers (root logger or children)
+        if not (
+            record.name == "opentelemetry" or record.name.startswith("opentelemetry.")
+        ):
+            return True
+
+        # Check if this is a connection/export error
+        if record.levelno == logging.ERROR and record.exc_info:
+            exc_type, exc_value, _ = record.exc_info
+            if exc_type and any(
+                fragment in exc_type.__name__
+                for fragment in self._NETWORK_ERROR_NAME_FRAGMENTS
+            ):
+                # Create error key for deduplication (type + truncated message)
+                error_key = f"{exc_type.__name__}"
+
+                # Track occurrence count
+                now = time.time()
+                count = self._error_counts.get(error_key, 0) + 1
+                self._error_counts[error_key] = count
+
+                last_logged = self._last_logged.get(error_key, 0)
+                time_since_last = now - last_logged
+
+                # Show first occurrence, or after cooldown expires
+                if count == 1 or time_since_last > self._cooldown_seconds:
+                    self._last_logged[error_key] = now
+
+                    # Replace verbose stack trace with simple message
+                    record.exc_info = None
+                    record.exc_text = None
+                    record.args = ()
+
+                    if count == 1:
+                        record.msg = f"Telemetry export failed: {exc_value}"
+                    else:
+                        # Show count of suppressed errors
+                        record.msg = (
+                            f"Telemetry export still failing "
+                            f"({count} occurrences): {exc_value}"
+                        )
+                    return True
+                # Suppress duplicate within cooldown period
+                return False
+
+        return True
+
+
+class NotGivenAttributeFilter(logging.Filter):
+    """Filter to suppress warnings about NotGiven type in telemetry attributes.
+
+    The opentelemetry-instrumentation-anthropic and opentelemetry-instrumentation-openai
+    libraries capture API parameters including those set to NOT_GIVEN sentinel values.
+    OTEL's attribute validation warns about these since NotGiven is not a valid
+    attribute type. The data is still exported correctly, so we suppress the warning.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Suppress NotGiven attribute type warnings.
+
+        Returns False to drop the record, True to allow it through.
+        """
+        # Check if this is a NotGiven type warning
+        # Suppress this specific warning - it's noise from sentinel values
+        return not (
+            record.name.startswith("opentelemetry.")
+            and record.levelno == logging.WARNING
+            and "NotGiven" in record.getMessage()
+            and "Invalid type" in record.getMessage()
+        )
+
+
+# Global variables to track telemetry state
+_telemetry_enabled = False
+_tracer = None
+_meter = None
+
+# Singleton filter instance for consistent debouncing across all loggers
+# Used by both setup_telemetry() and init_logging() in init.py
+_connection_error_filter: "TelemetryConnectionErrorFilter | None" = None
+
+
+def get_connection_error_filter(
+    cooldown_seconds: float = 300.0,
+) -> "TelemetryConnectionErrorFilter":
+    """Get or create the singleton TelemetryConnectionErrorFilter instance.
+
+    This ensures consistent debouncing state across all OpenTelemetry loggers,
+    whether filters are applied in setup_telemetry() or init_logging().
+
+    Args:
+        cooldown_seconds: Time between repeated error messages (default: 5 minutes)
+
+    Returns:
+        The singleton filter instance
+    """
+    global _connection_error_filter
+    if _connection_error_filter is None:
+        _connection_error_filter = TelemetryConnectionErrorFilter(cooldown_seconds)
+    return _connection_error_filter
+
+
+_token_counter = None
+_request_histogram = None
+_tool_counter = None
+_tool_duration_histogram = None
+_active_conversations_gauge = None
+_llm_request_counter = None
+
+# Probe for opentelemetry availability without importing it (saves ~1.4s startup
+# when telemetry is installed but not enabled). Probing the top-level package
+# only — find_spec on submodules triggers parent package init, defeating the
+# point of lazy loading. The full import happens inside init_telemetry().
+#
+# NOTE: TELEMETRY_AVAILABLE only reflects whether the top-level `opentelemetry`
+# package is on sys.path, not whether all required extras (exporter.otlp,
+# instrumentation.flask, etc.) are present. Use is_telemetry_enabled() to gate
+# on both availability and the RIG_TELEMETRY_ENABLED env var.
+TELEMETRY_AVAILABLE = _importlib_util.find_spec("opentelemetry") is not None
+TELEMETRY_IMPORT_ERROR: str | None = None
+if not TELEMETRY_AVAILABLE:
+    TELEMETRY_IMPORT_ERROR = "opentelemetry packages not installed"
+
+
+def is_telemetry_enabled() -> bool:
+    """Check if telemetry is enabled."""
+    return _telemetry_enabled and TELEMETRY_AVAILABLE
+
+
+def get_telemetry_objects():
+    """Get telemetry objects (tracer, meter, counters, etc.)."""
+    return {
+        "tracer": _tracer,
+        "meter": _meter,
+        "token_counter": _token_counter,
+        "request_histogram": _request_histogram,
+        "tool_counter": _tool_counter,
+        "tool_duration_histogram": _tool_duration_histogram,
+        "active_conversations_gauge": _active_conversations_gauge,
+        "llm_request_counter": _llm_request_counter,
+    }
+
+
+def set_conversation_context(
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Set the current conversation context for tracing.
+
+    This context propagates to all spans created in the current thread/async context,
+    enabling filtering by conversation in Jaeger.
+
+    Args:
+        conversation_id: Unique identifier for the conversation (e.g., log name)
+        session_id: Unique identifier for the session (e.g., UUID)
+    """
+    if conversation_id is not None:
+        _conversation_id.set(conversation_id)
+    if session_id is not None:
+        _session_id.set(session_id)
+
+
+def get_conversation_context() -> tuple[str | None, str | None]:
+    """Get the current conversation context.
+
+    Returns:
+        Tuple of (conversation_id, session_id)
+    """
+    return _conversation_id.get(), _session_id.get()
+
+
+def clear_conversation_context() -> None:
+    """Clear the conversation context."""
+    _conversation_id.set(None)
+    _session_id.set(None)
+
+
+def enrich_span_with_context(span: "Span") -> None:
+    """Add conversation context to a span.
+
+    Args:
+        span: The OpenTelemetry span to enrich
+    """
+    conversation_id, session_id = get_conversation_context()
+    if conversation_id:
+        span.set_attribute("conversation.id", conversation_id)
+    if session_id:
+        span.set_attribute("session.id", session_id)
+
+
+def enrich_span_with_llm_metrics(
+    span: "Span",
+    *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cost: float | None = None,
+) -> None:
+    """Add LLM metrics to a span for analysis in Jaeger.
+
+    Args:
+        span: The OpenTelemetry span to enrich
+        input_tokens: Number of input tokens (excluding cache)
+        output_tokens: Number of output tokens
+        cache_creation_tokens: Tokens written to cache
+        cache_read_tokens: Tokens read from cache
+        cost: Calculated cost in USD
+    """
+    if input_tokens is not None:
+        span.set_attribute("llm.tokens.input", input_tokens)
+    if output_tokens is not None:
+        span.set_attribute("llm.tokens.output", output_tokens)
+    if cache_creation_tokens is not None:
+        span.set_attribute("llm.cache.creation_tokens", cache_creation_tokens)
+    if cache_read_tokens is not None:
+        span.set_attribute("llm.cache.read_tokens", cache_read_tokens)
+
+    # Calculate and add cache hit rate
+    if cache_read_tokens is not None and cache_creation_tokens is not None:
+        total_cacheable = (
+            (input_tokens or 0) + cache_read_tokens + cache_creation_tokens
+        )
+        if total_cacheable > 0:
+            hit_rate = cache_read_tokens / total_cacheable
+            span.set_attribute("llm.cache.hit_rate", hit_rate)
+
+    if cost is not None:
+        span.set_attribute("llm.cost.usd", cost)
+
+
+def _otlp_timeout_seconds(default: float) -> float:
+    """OTLP export timeout in seconds, honoring the standard OTel env var.
+
+    rig previously hardcoded the OTLP export and force-flush timeouts. When a
+    collector accepts the TCP connection but stalls on the HTTP request (a
+    half-wedged collector), every session then blocks for the full timeout on
+    shutdown, with no way to fast-fail.
+
+    This honors the standard ``OTEL_EXPORTER_OTLP_TIMEOUT`` env var (milliseconds,
+    per the OpenTelemetry spec) so operators can fast-fail an unreachable
+    collector, e.g. ``OTEL_EXPORTER_OTLP_TIMEOUT=1000`` for a 1s timeout. Falls
+    back to ``default`` seconds when unset or invalid.
+    """
+    raw = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+    if not raw:
+        return default
+    try:
+        ms = int(float(raw))
+    except (ValueError, OverflowError):
+        logger.warning(
+            "Invalid OTEL_EXPORTER_OTLP_TIMEOUT=%r (expected integer milliseconds); "
+            "using %ss",
+            raw,
+            default,
+        )
+        return default
+    if ms <= 0:
+        logger.warning(
+            "Invalid OTEL_EXPORTER_OTLP_TIMEOUT=%r (must be a positive integer); "
+            "using %ss",
+            raw,
+            default,
+        )
+        return default
+    return max(0.001, ms / 1000.0)
+
+
+def init_telemetry(
+    service_name: str = "rig",
+    enable_flask_instrumentation: bool = True,
+    enable_requests_instrumentation: bool = True,
+    enable_openai_instrumentation: bool = True,
+    enable_anthropic_instrumentation: bool = True,
+    agent_name: str | None = None,
+    interactive: bool | None = None,
+) -> None:
+    """Initialize OpenTelemetry tracing and metrics.
+
+    Args:
+        service_name: Name of the service for telemetry
+        enable_flask_instrumentation: Whether to auto-instrument Flask
+        enable_requests_instrumentation: Whether to auto-instrument requests library
+        enable_openai_instrumentation: Whether to auto-instrument OpenAI
+        enable_anthropic_instrumentation: Whether to auto-instrument Anthropic
+        agent_name: Name of the agent (from rig.toml [agent].name)
+        interactive: Whether running in interactive mode (None = unknown, False = autonomous)
+    """
+    global _telemetry_enabled, _tracer, _meter, _token_counter, _request_histogram
+    global \
+        _tool_counter, \
+        _tool_duration_histogram, \
+        _active_conversations_gauge, \
+        _llm_request_counter
+
+    # Check if telemetry is enabled via environment variable
+    if os.getenv("RIG_TELEMETRY_ENABLED", "").lower() not in ("true", "1", "yes"):
+        logger.debug(
+            "Telemetry not enabled. Set RIG_TELEMETRY_ENABLED=true to enable."
+        )
+        return
+
+    if not TELEMETRY_AVAILABLE:
+        error_msg = "OpenTelemetry dependencies not available. Install with: pip install rig[telemetry]"
+        if TELEMETRY_IMPORT_ERROR:
+            error_msg += f" (Import error: {TELEMETRY_IMPORT_ERROR})"
+        logger.warning(error_msg)
+        return
+
+    # Real opentelemetry imports happen here, after the env-var gate, so users
+    # who have telemetry installed but disabled don't pay the ~1.4s import cost.
+    try:
+        from opentelemetry import metrics, trace  # fmt: skip
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter,  # fmt: skip
+        )
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,  # fmt: skip
+        )
+        from opentelemetry.instrumentation.anthropic import (
+            AnthropicInstrumentor,  # fmt: skip
+        )
+        from opentelemetry.instrumentation.flask import FlaskInstrumentor  # fmt: skip
+        from opentelemetry.instrumentation.openai import OpenAIInstrumentor  # fmt: skip
+        from opentelemetry.instrumentation.requests import (
+            RequestsInstrumentor,  # fmt: skip
+        )
+        from opentelemetry.instrumentation.threading import (
+            ThreadingInstrumentor,  # fmt: skip
+        )
+        from opentelemetry.sdk.metrics import MeterProvider  # fmt: skip
+        from opentelemetry.sdk.metrics.export import (
+            PeriodicExportingMetricReader,  # fmt: skip
+        )
+        from opentelemetry.sdk.metrics.view import (  # fmt: skip
+            ExplicitBucketHistogramAggregation,
+            View,
+        )
+        from opentelemetry.sdk.resources import Resource  # fmt: skip
+        from opentelemetry.sdk.trace import TracerProvider  # fmt: skip
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor  # fmt: skip
+    except ImportError as e:
+        logger.warning(
+            "OpenTelemetry dependencies not fully available (install with: "
+            "pip install rig[telemetry]). Import error: %s",
+            e,
+        )
+        return
+
+    try:
+        # Initialize tracing with proper service name and additional metadata
+        resource_attrs = {"service.name": service_name}
+
+        # Add hostname (standard OpenTelemetry attribute)
+
+        try:
+            hostname = socket.gethostname()
+            resource_attrs["host.name"] = hostname
+            logger.debug(f"Adding host.name to resource: {hostname}")
+        except Exception as e:
+            logger.warning(f"Failed to get hostname: {e}")
+
+        # Add agent name if provided
+        if agent_name:
+            resource_attrs["agent.name"] = agent_name
+            logger.debug(f"Adding agent.name to resource: {agent_name}")
+
+        # Add interactive mode if known
+        if interactive is not None:
+            resource_attrs["agent.interactive"] = str(interactive).lower()
+            if not interactive:
+                logger.debug("Running in autonomous mode")
+
+        # Add run type from environment (e.g., "autonomous", "monitoring", "manual")
+        # This allows distinguishing different types of non-interactive runs
+        run_type = os.getenv("RIG_RUN_TYPE")
+        if run_type:
+            resource_attrs["agent.run_type"] = run_type
+            logger.debug(f"Adding agent.run_type to resource: {run_type}")
+
+        resource = Resource.create(resource_attrs)
+        trace.set_tracer_provider(TracerProvider(resource=resource))
+        _tracer = trace.get_tracer(service_name)
+
+        # Set up OTLP exporter if endpoint provided (for Jaeger or other OTLP-compatible backends)
+        # Using HTTP instead of gRPC for better compatibility
+        # OTLP uses port 4318 for HTTP, 4317 for gRPC
+        # HTTP exporters need the full path including /v1/traces
+        otlp_endpoint = os.getenv("OTLP_ENDPOINT") or "http://localhost:4318"
+
+        # Ensure endpoint ends with /v1/traces for the trace exporter
+        trace_endpoint = otlp_endpoint
+        if not trace_endpoint.endswith("/v1/traces"):
+            trace_endpoint = trace_endpoint.rstrip("/") + "/v1/traces"
+
+        # Export timeout (seconds). Defaults to 10s but honors
+        # OTEL_EXPORTER_OTLP_TIMEOUT so operators can fast-fail a wedged collector.
+        export_timeout = _otlp_timeout_seconds(default=10.0)
+
+        otlp_exporter = OTLPSpanExporter(
+            endpoint=trace_endpoint,
+            # round() returns int (SDK requires int); max(1, ...) avoids truncating
+            # sub-second values to 0 (which causes immediate timeout).
+            timeout=max(1, round(export_timeout)),
+        )
+        span_processor = BatchSpanProcessor(
+            otlp_exporter,
+            max_export_batch_size=512,
+            schedule_delay_millis=5000,  # Export every 5 seconds
+        )
+        tracer_provider = trace.get_tracer_provider()
+        if hasattr(tracer_provider, "add_span_processor"):
+            tracer_provider.add_span_processor(span_processor)
+
+        # Use OTLP for metrics (same endpoint as traces)
+        try:
+            # Ensure endpoint ends with /v1/metrics for the metric exporter
+            metric_endpoint = otlp_endpoint
+            if not metric_endpoint.endswith("/v1/metrics"):
+                metric_endpoint = metric_endpoint.rstrip("/") + "/v1/metrics"
+
+            otlp_metric_exporter = OTLPMetricExporter(
+                endpoint=metric_endpoint,
+                # round() returns int (SDK requires int); max(1, ...) avoids truncating
+                # sub-second values to 0 (which causes immediate timeout).
+                timeout=max(1, round(export_timeout)),
+            )
+            metric_reader = PeriodicExportingMetricReader(
+                otlp_metric_exporter,
+                export_interval_millis=10000,  # Export every 10 seconds (faster feedback)
+                export_timeout_millis=int(export_timeout * 1000),
+            )
+            # Configure custom histogram buckets for different metrics
+            # Tool durations: 0.1s to 5min (most tools: 0.1-30s)
+            tool_duration_view = View(
+                instrument_name="rig_tool_duration_seconds",
+                aggregation=ExplicitBucketHistogramAggregation(
+                    boundaries=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0]
+                ),
+            )
+
+            # HTTP request durations: 10ms to 30s (most requests: 50ms-5s)
+            request_duration_view = View(
+                instrument_name="rig_request_duration_seconds",
+                aggregation=ExplicitBucketHistogramAggregation(
+                    boundaries=[0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+                ),
+            )
+
+            metrics.set_meter_provider(
+                MeterProvider(
+                    resource=resource,
+                    metric_readers=[metric_reader],
+                    views=[tool_duration_view, request_duration_view],
+                )
+            )
+        except ImportError as e:
+            logger.warning(f"OTLP metric exporter not available: {e}")
+            # Initialize without metrics if OTLP not available
+            # Still configure views for consistency
+            tool_duration_view = View(
+                instrument_name="rig_tool_duration_seconds",
+                aggregation=ExplicitBucketHistogramAggregation(
+                    boundaries=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0]
+                ),
+            )
+
+            request_duration_view = View(
+                instrument_name="rig_request_duration_seconds",
+                aggregation=ExplicitBucketHistogramAggregation(
+                    boundaries=[0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+                ),
+            )
+
+            metrics.set_meter_provider(
+                MeterProvider(views=[tool_duration_view, request_duration_view])
+            )
+
+        _meter = metrics.get_meter(service_name)
+
+        # Create metrics
+        _token_counter = _meter.create_counter(
+            name="rig_tokens_processed",
+            description="Number of tokens processed",
+            unit="tokens",
+        )
+
+        _request_histogram = _meter.create_histogram(
+            name="rig_request_duration_seconds",
+            description="Request duration in seconds",
+            unit="seconds",
+        )
+
+        _tool_counter = _meter.create_counter(
+            name="rig_tool_calls",
+            description="Number of tool calls made",
+            unit="calls",
+        )
+
+        _tool_duration_histogram = _meter.create_histogram(
+            name="rig_tool_duration_seconds",
+            description="Tool execution duration in seconds",
+            unit="seconds",
+        )
+
+        _active_conversations_gauge = _meter.create_up_down_counter(
+            name="rig_active_conversations",
+            description="Number of active conversations",
+            unit="conversations",
+        )
+
+        _llm_request_counter = _meter.create_counter(
+            name="rig_llm_requests",
+            description="Number of LLM API requests made",
+            unit="requests",
+        )
+
+        # Auto-instrument Flask and requests if enabled
+        if enable_flask_instrumentation:
+            FlaskInstrumentor().instrument()
+
+        if enable_requests_instrumentation:
+            RequestsInstrumentor().instrument()
+
+        if enable_openai_instrumentation:
+            OpenAIInstrumentor().instrument()
+
+        if enable_anthropic_instrumentation:
+            AnthropicInstrumentor().instrument()
+
+        # Always enable threading instrumentation for context propagation
+        # This is critical for server mode where threads handle requests
+        ThreadingInstrumentor().instrument()
+
+        _telemetry_enabled = True
+
+        # Apply filters to OpenTelemetry loggers
+        # Use singleton to ensure consistent debouncing state
+        connection_filter = get_connection_error_filter()
+        notgiven_filter = NotGivenAttributeFilter()
+
+        # Connection error filter truncates verbose stack traces to single lines
+        for otel_logger_name in [
+            "opentelemetry.exporter.otlp.proto.http",
+            "opentelemetry.sdk._shared_internal",
+            "opentelemetry.sdk.metrics._internal.export",
+        ]:
+            otel_logger = logging.getLogger(otel_logger_name)
+            otel_logger.addFilter(connection_filter)
+
+        # NotGiven filter suppresses warnings about sentinel values in attributes
+        # This affects the attribute validation logger
+        otel_attributes_logger = logging.getLogger("opentelemetry.attributes")
+        otel_attributes_logger.addFilter(notgiven_filter)
+
+        # Import console for user-visible messages
+        from . import console  # fmt: skip
+
+        # Log to console so users know telemetry is active
+        console.log(f"Using OTLP to send metrics and traces to {otlp_endpoint}")
+
+    except Exception as e:
+        logger.error(f"Failed to initialize telemetry: {e}")
+
+
+def shutdown_telemetry() -> None:
+    """Shutdown telemetry providers."""
+    global _telemetry_enabled
+
+    if not _telemetry_enabled:
+        return
+
+    # Lazy import — telemetry was enabled, so opentelemetry was already imported
+    # by init_telemetry(); this is a near-free re-import from sys.modules.
+    try:
+        from opentelemetry import metrics, trace  # fmt: skip
+    except ImportError as e:
+        logger.warning("Cannot shut down telemetry: %s", e)
+        return
+
+    # Flush timeout (ms). Defaults to 5s but honors OTEL_EXPORTER_OTLP_TIMEOUT so
+    # a wedged collector doesn't block session shutdown for the full default.
+    # Note: OTEL_EXPORTER_OTLP_TIMEOUT is technically a per-request HTTP timeout,
+    # but we reuse it here for the overall flush window too. Setting it short
+    # (e.g. 2000 for 2s) caps the entire force_flush, not just a single export —
+    # if the collector is slow the flush may abort before a batch completes.
+    # This is intentional: fast-fail is the point, and a separate env var would
+    # add complexity with little gain for rig's single-batch shutdown pattern.
+    flush_timeout_millis = int(_otlp_timeout_seconds(default=5.0) * 1000)
+
+    try:
+        # Force flush any pending spans before shutdown
+        tracer_provider = trace.get_tracer_provider()
+        if hasattr(tracer_provider, "force_flush"):
+            logger.debug("Flushing pending traces...")
+            tracer_provider.force_flush(timeout_millis=flush_timeout_millis)
+
+        # Shutdown tracer provider
+        if hasattr(tracer_provider, "shutdown"):
+            tracer_provider.shutdown()
+
+        # Force flush and shutdown meter provider
+        meter_provider = metrics.get_meter_provider()
+        if hasattr(meter_provider, "force_flush"):
+            logger.debug("Flushing pending metrics...")
+            meter_provider.force_flush(timeout_millis=flush_timeout_millis)
+        if hasattr(meter_provider, "shutdown"):
+            logger.debug("Shutting down meter provider...")
+            meter_provider.shutdown()
+
+        _telemetry_enabled = False
+        logger.info("Telemetry shutdown successfully")
+
+    except Exception as e:
+        logger.error(f"Failed to shutdown telemetry: {e}")

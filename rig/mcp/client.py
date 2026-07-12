@@ -1,0 +1,522 @@
+import asyncio
+import logging
+import os
+from collections.abc import Callable, Coroutine
+from contextlib import AsyncExitStack
+from typing import Any
+
+import mcp.types as types  # Import all types
+from mcp import ClientSession
+from mcp.client.session import RequestContext
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamablehttp_client
+
+from rig.circuit_breaker import CircuitBreaker
+from rig.config import Config, get_config
+
+# Type alias for elicitation callback
+ElicitationCallback = Callable[
+    [types.ElicitRequestParams],
+    Coroutine[Any, Any, types.ElicitResult | types.ErrorData],
+]
+
+logger = logging.getLogger(__name__)
+
+
+class MCPInterruptedError(Exception):
+    """Raised when an MCP operation is interrupted by the user.
+
+    This is a regular Exception (not BaseException) so it doesn't trigger
+    aggressive cleanup that would terminate the MCP server process.
+    """
+
+
+def _is_connection_error(error: Exception) -> bool:
+    """Check if error indicates MCP connection failure"""
+    error_msg = str(error).lower()
+    return any(
+        phrase in error_msg
+        for phrase in [
+            "connection closed",
+            "connection refused",
+            "connection reset",
+            "broken pipe",
+            "pipe closed",
+            "transport closed",
+            "session closed",
+            "server closed",
+            "process terminated",
+            "no such process",
+        ]
+    )
+
+
+class MCPClient:
+    """A client for interacting with MCP servers"""
+
+    def __init__(self, config: Config | None = None):
+        """Initialize the client with optional config"""
+        self.config = config or get_config()
+        self.loop = asyncio.new_event_loop()
+        # Don't call asyncio.set_event_loop() — each client owns its own loop
+        # and uses it exclusively via self.loop.run_until_complete() in _run_async().
+        # Setting it as the thread-global loop would cause multiple MCPClient
+        # instances to overwrite each other's loops.
+        logger.debug(f"Init - Loop ID: {id(self.loop)}")
+        self.session: ClientSession | None = None
+        self.tools: types.ListToolsResult | None = None
+        self.stack: AsyncExitStack | None = None
+        self.roots: list[types.Root] = []
+        self._elicitation_callback: ElicitationCallback | None = None
+        # Per-client circuit breaker, keyed by server name after connect().
+        # The breaker protects call_tool() calls from hammering a broken server.
+        self._circuit_breaker: CircuitBreaker | None = None
+
+    def _run_async(self, coro):
+        """Run a coroutine in the event loop.
+
+        Handles KeyboardInterrupt gracefully to avoid killing the MCP server
+        when the user interrupts a conversation.
+        """
+        try:
+            logger.debug(f"_run_async start - Loop ID: {id(self.loop)}")
+            result = self.loop.run_until_complete(coro)
+            logger.debug(f"_run_async end - Loop ID: {id(self.loop)}")
+            return result
+        except KeyboardInterrupt:
+            # Cancel the pending task gracefully instead of letting the interrupt
+            # propagate and potentially kill the MCP server process
+            logger.info("MCP operation interrupted by user")
+            # Cancel any pending tasks in the event loop
+            for task in asyncio.all_tasks(self.loop):
+                if not task.done():
+                    task.cancel()
+            # Give tasks a chance to clean up
+            try:
+                self.loop.run_until_complete(asyncio.sleep(0.1))
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            # Raise a regular exception instead of re-raising KeyboardInterrupt
+            # This prevents the interrupt from propagating to the stdio_client
+            # context manager and killing the server process
+            raise MCPInterruptedError("MCP operation interrupted by user") from None
+        except Exception as e:
+            if _is_connection_error(e):
+                logger.info(f"MCP connection error (will retry): {e}")
+            else:
+                logger.error(f"Unexpected MCP error: {e}")
+            raise
+
+    async def _read_stderr(self, stderr):
+        """Read stderr without blocking the main flow"""
+        try:
+            while True:
+                line = await stderr.readline()
+                if not line:
+                    break
+                logger.debug(f"Server stderr: {line.decode().strip()}")
+        except Exception as e:
+            logger.debug(f"Stderr reader stopped: {e}")
+
+    async def _list_roots_callback(
+        self, context: RequestContext["ClientSession", Any]
+    ) -> types.ListRootsResult:
+        """Callback for servers to request the list of roots.
+
+        This callback is invoked when an MCP server sends a roots/list request.
+        """
+        logger.debug(f"Server requested roots list, returning {len(self.roots)} roots")
+        return types.ListRootsResult(roots=self.roots)
+
+    async def _elicitation_callback_wrapper(
+        self,
+        context: RequestContext["ClientSession", Any],
+        params: types.ElicitRequestParams,
+    ) -> types.ElicitResult | types.ErrorData:
+        """Callback for servers to request user input via elicitation.
+
+        This callback is invoked when an MCP server sends an elicitation/create request.
+        """
+        logger.debug(f"Server requested elicitation: {params.message}")
+        if self._elicitation_callback is None:
+            logger.warning("Elicitation requested but no callback configured")
+            return types.ElicitResult(action="decline", content=None)
+        try:
+            result = await self._elicitation_callback(params)
+            return result
+        except Exception as e:
+            logger.error(f"Elicitation callback error: {e}")
+            return types.ErrorData(code=-32000, message=str(e))
+
+    def set_elicitation_callback(self, callback: ElicitationCallback | None) -> None:
+        """Set the callback for handling elicitation requests from MCP servers.
+
+        Args:
+            callback: Async function that takes ElicitRequestParams and returns
+                      ElicitResult or ErrorData. Set to None to disable elicitation.
+        """
+        self._elicitation_callback = callback
+        logger.debug(f"Elicitation callback {'set' if callback else 'cleared'}")
+
+    def has_elicitation_callback(self) -> bool:
+        """Check if an elicitation callback is set.
+
+        Returns:
+            True if elicitation is enabled, False otherwise.
+        """
+        return self._elicitation_callback is not None
+
+    async def _setup_stdio_connection(
+        self, server_params
+    ) -> tuple[types.ListToolsResult, ClientSession]:
+        """Set up stdio connection and maintain it"""
+        self.stack = AsyncExitStack()
+        await self.stack.__aenter__()
+
+        try:
+            transport = await self.stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            read, write = transport
+
+            csession = ClientSession(
+                read,
+                write,
+                list_roots_callback=self._list_roots_callback,
+                elicitation_callback=self._elicitation_callback_wrapper,
+            )
+            session = await self.stack.enter_async_context(csession)
+            self.session = session  # Assign to self.session after the await
+
+            if not self.session:
+                raise RuntimeError("Failed to initialize session")
+
+            # Some MCP servers require initialization (e.g. OAuth flows)
+            # So we give some leeway for user to have time to complete that
+            await asyncio.wait_for(self.session.initialize(), timeout=60.0)
+            tools = await asyncio.wait_for(self.session.list_tools(), timeout=10.0)
+            self.tools = tools  # Assign after await
+
+            if not self.tools:
+                raise RuntimeError("Failed to get tools list")
+
+            return (self.tools, self.session)
+        except Exception:
+            if self.stack:
+                await self.stack.__aexit__(None, None, None)
+                self.stack = None
+            raise
+
+    async def _setup_http_connection(
+        self, url: str, headers: dict
+    ) -> tuple[types.ListToolsResult, ClientSession]:
+        """Set up HTTP connection and maintain it"""
+        self.stack = AsyncExitStack()
+        await self.stack.__aenter__()
+
+        try:
+            transport = await self.stack.enter_async_context(
+                streamablehttp_client(url, headers=headers)
+            )
+            read, write, _ = transport
+
+            csession = ClientSession(
+                read,
+                write,
+                list_roots_callback=self._list_roots_callback,
+                elicitation_callback=self._elicitation_callback_wrapper,
+            )
+            session = await self.stack.enter_async_context(csession)
+            self.session = session
+
+            if not self.session:
+                raise RuntimeError("Failed to initialize session")
+
+            await asyncio.wait_for(self.session.initialize(), timeout=5.0)
+            tools = await asyncio.wait_for(self.session.list_tools(), timeout=10.0)
+            self.tools = tools
+
+            if not self.tools:
+                raise RuntimeError("Failed to get tools list")
+
+            return (self.tools, self.session)
+        except Exception:
+            if self.stack:
+                await self.stack.__aexit__(None, None, None)
+                self.stack = None
+            raise
+
+    def connect(self, server_name: str) -> tuple[types.ListToolsResult, ClientSession]:
+        """Connect to an MCP server by name"""
+        if not self.config.mcp.enabled:
+            raise RuntimeError("MCP is not enabled in config")
+
+        server = next(
+            (s for s in self.config.mcp.servers if s.name == server_name), None
+        )
+        if not server:
+            raise ValueError(f"No MCP server config found for '{server_name}'")
+
+        if server.is_http:
+            # HTTP MCP server
+            tools, session = self._run_async(
+                self._setup_http_connection(server.url, server.headers)
+            )
+        else:
+            # Stdio MCP server
+            env = server.env or {}
+            env.update(os.environ)
+
+            params = StdioServerParameters(
+                command=server.command, args=server.args, env=env
+            )
+            tools, session = self._run_async(self._setup_stdio_connection(params))
+
+        # Create a per-server circuit breaker (default: 5 failures / 30s cooldown).
+        self._circuit_breaker = CircuitBreaker(name=f"mcp:{server_name}")
+        logger.info(f"Tools: {tools}")
+        return tools, session
+
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """Synchronous tool call method.
+
+        Raises:
+            CircuitOpenError: If the circuit breaker for this server is open
+                (i.e. consecutive failures have exceeded the threshold).  Callers
+                should treat this as a transient error and surface it to the user.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _call_tool():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await session.call_tool(tool_name, arguments)
+            # Safely access content for logging
+            if (
+                result.content
+                and len(result.content) > 0
+                and isinstance(result.content[0], types.TextContent)
+            ):
+                content_text = result.content[0].text
+                logger.debug(f"result {content_text}")
+
+            if result.content:
+                for content in result.content:
+                    if isinstance(content, types.TextContent):
+                        return content.text
+            return str(result)
+
+        # Wrap the synchronous _run_async call with the circuit breaker so that
+        # consecutive transport or server-side failures trip the breaker.
+        # Use a lambda so the coroutine is only created if the breaker allows
+        # the call through — avoids RuntimeWarning on every open-circuit fast-fail.
+        # MCPInterruptedError (user Ctrl-C) is excluded from failure counting.
+        if self._circuit_breaker is not None:
+            return self._circuit_breaker.call(
+                lambda: self._run_async(_call_tool()),
+                ignore_exceptions=(MCPInterruptedError,),
+            )
+        return self._run_async(_call_tool())
+
+    def list_resources(self) -> types.ListResourcesResult:
+        """List available resources from the connected MCP server.
+
+        Returns:
+            ListResourcesResult containing available resources.
+
+        Raises:
+            RuntimeError: If not connected to an MCP server.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _list_resources():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await asyncio.wait_for(session.list_resources(), timeout=10.0)
+            logger.debug(f"Resources: {result}")
+            return result
+
+        return self._run_async(_list_resources())
+
+    def read_resource(self, uri: str) -> types.ReadResourceResult:
+        """Read a specific resource by URI.
+
+        Args:
+            uri: The URI of the resource to read.
+
+        Returns:
+            ReadResourceResult containing the resource contents.
+
+        Raises:
+            RuntimeError: If not connected to an MCP server.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _read_resource():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await asyncio.wait_for(
+                session.read_resource(types.AnyUrl(uri)), timeout=30.0
+            )
+            logger.debug(f"Resource content: {result}")
+            return result
+
+        return self._run_async(_read_resource())
+
+    def list_resource_templates(self) -> types.ListResourceTemplatesResult:
+        """List available resource templates from the connected MCP server.
+
+        Resource templates are parameterized resources like `db://table/{name}`.
+
+        Returns:
+            ListResourceTemplatesResult containing available templates.
+
+        Raises:
+            RuntimeError: If not connected to an MCP server.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _list_templates():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await asyncio.wait_for(
+                session.list_resource_templates(), timeout=10.0
+            )
+            logger.debug(f"Resource templates: {result}")
+            return result
+
+        return self._run_async(_list_templates())
+
+    def list_prompts(self) -> types.ListPromptsResult:
+        """List available prompts from the connected MCP server.
+
+        Returns:
+            ListPromptsResult containing available prompts.
+
+        Raises:
+            RuntimeError: If not connected to an MCP server.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _list_prompts():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await asyncio.wait_for(session.list_prompts(), timeout=10.0)
+            logger.debug(f"Prompts: {result}")
+            return result
+
+        return self._run_async(_list_prompts())
+
+    def get_prompt(
+        self, name: str, arguments: dict[str, str] | None = None
+    ) -> types.GetPromptResult:
+        """Get a specific prompt by name with optional arguments.
+
+        Args:
+            name: The name of the prompt to retrieve.
+            arguments: Optional arguments to pass to the prompt.
+
+        Returns:
+            GetPromptResult containing the prompt messages.
+
+        Raises:
+            RuntimeError: If not connected to an MCP server.
+        """
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+
+        async def _get_prompt():
+            session = self.session
+            if session is None:
+                raise RuntimeError("Should not be None")
+
+            result = await asyncio.wait_for(
+                session.get_prompt(name, arguments=arguments), timeout=30.0
+            )
+            logger.debug(f"Prompt content: {result}")
+            return result
+
+        return self._run_async(_get_prompt())
+
+    # Roots management methods
+
+    def set_roots(self, roots: list[types.Root]) -> None:
+        """Set the list of roots and notify connected server.
+
+        Args:
+            roots: List of Root objects defining operational boundaries.
+        """
+        self.roots = roots
+        logger.debug(f"Set {len(roots)} roots")
+        if self.session:
+            self._run_async(self._send_roots_changed())
+
+    def get_roots(self) -> list[types.Root]:
+        """Get the current list of roots.
+
+        Returns:
+            List of configured Root objects.
+        """
+        return self.roots
+
+    def add_root(self, uri: str, name: str | None = None) -> bool:
+        """Add a root and notify connected server.
+
+        Args:
+            uri: The URI of the root (e.g., 'file:///path/to/project')
+            name: Optional human-readable name for the root
+
+        Returns:
+            True if root was added, False if it already exists.
+        """
+        # Check for duplicate roots by URI
+        for existing in self.roots:
+            if str(existing.uri) == uri:
+                logger.debug(f"Root already exists: {uri}")
+                return False
+
+        root = types.Root(uri=types.FileUrl(uri), name=name)
+        self.roots.append(root)
+        logger.debug(f"Added root: {uri}")
+        if self.session:
+            self._run_async(self._send_roots_changed())
+        return True
+
+    def remove_root(self, uri: str) -> bool:
+        """Remove a root by URI and notify connected server.
+
+        Args:
+            uri: The URI of the root to remove.
+
+        Returns:
+            True if the root was found and removed, False otherwise.
+        """
+        initial_count = len(self.roots)
+        self.roots = [r for r in self.roots if str(r.uri) != uri]
+        removed = len(self.roots) < initial_count
+        if removed:
+            logger.debug(f"Removed root: {uri}")
+            if self.session:
+                self._run_async(self._send_roots_changed())
+        return removed
+
+    async def _send_roots_changed(self) -> None:
+        """Send roots/list_changed notification to the server."""
+        if self.session:
+            await self.session.send_roots_list_changed()
+            logger.debug("Sent roots_list_changed notification")

@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+"""
+Time awareness hook.
+
+Provides time feedback during conversations to help the assistant manage
+long-running sessions effectively.
+
+This helps the assistant:
+- Understand conversation duration
+- Plan work within time constraints
+- Manage long-running autonomous sessions effectively
+- Avoid timeouts and performance issues
+
+Shows time elapsed messages at: 1min, 5min, 10min, 15min, 20min, then every 10min.
+"""
+
+import logging
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+from ..hooks import HookType, StopPropagation, register_hook
+from ..message import Message
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from ..hooks.types import ToolExecutePostData
+
+logger = logging.getLogger(__name__)
+
+# Context-local storage for time tracking (ensures context safety in rig-server)
+_conversation_start_times_var: ContextVar[dict[str, datetime] | None] = ContextVar(
+    "conversation_start_times", default=None
+)
+_shown_milestones_var: ContextVar[dict[str, set[int]] | None] = ContextVar(
+    "shown_milestones", default=None
+)
+
+
+def _ensure_locals():
+    """Initialize context-local storage if needed."""
+    if _conversation_start_times_var.get() is None:
+        _conversation_start_times_var.set({})
+    if _shown_milestones_var.get() is None:
+        _shown_milestones_var.set({})
+
+
+def add_time_message(
+    data: ToolExecutePostData,
+) -> Generator[Message | StopPropagation, None, None]:
+    """Add time elapsed message after tool execution.
+
+    Shows messages at: 1min, 5min, 10min, 15min, 20min, then every 10min.
+
+    Args:
+        data: Post-execution context (log, workspace, tool_use).
+    """
+    try:
+        workspace = data.workspace
+        if workspace is None:
+            return
+
+        workspace_str = str(workspace)
+
+        # Ensure context-local storage is initialized
+        _ensure_locals()
+
+        conversation_start_times = _conversation_start_times_var.get()
+        shown_milestones = _shown_milestones_var.get()
+        assert conversation_start_times is not None
+        assert shown_milestones is not None
+
+        # Initialize conversation start time if first message
+        if workspace_str not in conversation_start_times:
+            conversation_start_times[workspace_str] = datetime.now(tz=timezone.utc)
+            _conversation_start_times_var.set(conversation_start_times)
+            shown_milestones[workspace_str] = set()
+            _shown_milestones_var.set(shown_milestones)
+            return
+
+        # Calculate elapsed time in minutes
+        elapsed = (
+            datetime.now(tz=timezone.utc) - conversation_start_times[workspace_str]
+        )
+        elapsed_minutes = int(elapsed.total_seconds() / 60)
+
+        # Determine which milestone to show
+        milestone = _get_next_milestone(elapsed_minutes)
+
+        # Check if we should show this milestone
+        if milestone and milestone not in shown_milestones[workspace_str]:
+            shown_milestones[workspace_str].add(milestone)
+            _shown_milestones_var.set(shown_milestones)
+
+            # Format time message
+            hours = elapsed_minutes // 60
+            minutes = elapsed_minutes % 60
+
+            time_str = datetime.now(tz=timezone.utc).strftime("%H:%M")
+            if hours > 0:
+                elapsed_str = f"{hours}h {minutes}min" if minutes > 0 else f"{hours}h"
+            else:
+                elapsed_str = f"{minutes}min"
+
+            message = Message(
+                "system",
+                f"<system_info>The time is now {time_str}. Time elapsed: {elapsed_str}</system_info>",
+                hide=True,
+            )
+            yield message
+
+    except Exception as e:
+        logger.exception(f"Error adding time message: {e}")
+
+
+def _get_next_milestone(elapsed_minutes: int) -> int | None:
+    """Get the next milestone to show based on elapsed minutes.
+
+    Milestones: 1, 5, 10, 15, 20, then every 10 minutes.
+    """
+    if elapsed_minutes < 1:
+        return None
+    if elapsed_minutes < 5:
+        return 1
+    if elapsed_minutes < 10:
+        return 5
+    if elapsed_minutes < 15:
+        return 10
+    if elapsed_minutes < 20:
+        return 15
+    if elapsed_minutes < 30:
+        return 20
+    # Every 10 minutes after 20
+    return (elapsed_minutes // 10) * 10
+
+
+def register() -> None:
+    """Register the time awareness hook with the hook system."""
+    register_hook(
+        "time_awareness.time_message",
+        HookType.TOOL_EXECUTE_POST,
+        add_time_message,
+        priority=0,  # Normal priority
+    )
+    logger.debug("Registered time awareness hook")

@@ -1,0 +1,860 @@
+name: Tauri
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'tauri/**'
+      - 'webui/**'
+      - '.github/workflows/tauri.yml'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'tauri/**'
+      - 'webui/**'
+      - '.github/workflows/tauri.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build for (e.g., v0.31.1.dev20260310)'
+        required: false
+
+jobs:
+  lint:
+    name: Lint (format + clippy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Check formatting
+        run: cd tauri/src-tauri && cargo fmt -- --check
+
+      - name: Install Linux dependencies
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Create placeholder sidecar for tauri-build
+        run: |
+          # tauri-build checks that externalBin paths exist at compile time.
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          touch "tauri/bins/rig-server-${TRIPLE}"
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          # Minimal valid PNG (1x1 transparent pixel)
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Run clippy
+        run: cd tauri/src-tauri && cargo clippy -- -D warnings
+
+  test:
+    name: Test (unit + IPC)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux dependencies
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Create placeholder sidecar for tauri-build
+        run: |
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          touch "tauri/bins/rig-server-${TRIPLE}"
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Run Rust tests
+        run: cd tauri/src-tauri && cargo test
+
+  e2e:
+    name: E2E tests (tauri-driver, Linux)
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    env:
+      TAURI_DRIVER_VERSION: 2.0.6
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux dependencies
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf \
+            xvfb webkit2gtk-driver
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+          cache-on-failure: true
+
+      - name: Cache tauri-driver install
+        id: tauri-driver-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo-tauri-driver
+          key: ${{ runner.os }}-${{ runner.arch }}-tauri-driver-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: tauri/e2e/package-lock.json
+
+      - name: Create placeholder sidecar for tauri-build
+        run: |
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          touch "tauri/bins/rig-server-${TRIPLE}"
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Create webui placeholder for E2E (chat mock)
+        run: |
+          mkdir -p webui/dist
+          cat > webui/dist/index.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>rig</title>
+            <style>
+              body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+              #messages { list-style: none; padding: 0; min-height: 100px; }
+              .message { padding: 8px 12px; margin: 4px 0; border-radius: 8px; }
+              .message.user { background: #e3f2fd; }
+              .message.assistant { background: #f1f8e9; }
+              #input-area { display: flex; gap: 8px; margin-top: 16px; }
+              #message-input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+              #send-btn { padding: 8px 16px; background: #1976d2; color: white; border: none; border-radius: 4px; cursor: pointer; }
+              #send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+            </style>
+          </head>
+          <body>
+            <div id="app">
+              <div id="conversation-title" data-testid="conversation-title">New Conversation</div>
+              <ul id="messages" data-testid="message-list"></ul>
+              <div id="input-area">
+                <input id="message-input" data-testid="message-input" type="text" placeholder="Type a message..." />
+                <button id="send-btn" data-testid="send-button">Send</button>
+              </div>
+            </div>
+            <script>
+              var msgCount = 0;
+              function addMessage(text, role) {
+                var li = document.createElement('li');
+                li.className = 'message ' + role;
+                li.setAttribute('data-testid', 'message-' + role + '-' + msgCount);
+                li.textContent = text;
+                document.getElementById('messages').appendChild(li);
+                msgCount++;
+              }
+              function sendMessage() {
+                var input = document.getElementById('message-input');
+                var btn = document.getElementById('send-btn');
+                var text = input.value.trim();
+                if (!text) return;
+                var title = document.getElementById('conversation-title');
+                if (title.textContent === 'New Conversation') {
+                  title.textContent = text.slice(0, 40) + (text.length > 40 ? '...' : '');
+                }
+                addMessage(text, 'user');
+                input.value = '';
+                btn.disabled = true;
+                setTimeout(function() {
+                  addMessage('Mock response to: ' + text, 'assistant');
+                  btn.disabled = false;
+                }, 400);
+              }
+              document.getElementById('send-btn').addEventListener('click', sendMessage);
+              document.getElementById('message-input').addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') sendMessage();
+              });
+              document.getElementById('app').setAttribute('data-ready', 'true');
+            </script>
+          </body>
+          </html>
+          HTMLEOF
+
+      - name: Build Tauri debug binary
+        run: cd tauri/src-tauri && cargo build
+
+      - name: Add tauri-driver to PATH
+        run: echo "$HOME/.cargo-tauri-driver/bin" >> "$GITHUB_PATH"
+
+      - name: Install tauri-driver
+        if: steps.tauri-driver-cache.outputs.cache-hit != 'true'
+        run: cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION" --root "$HOME/.cargo-tauri-driver"
+
+      - name: Verify tauri-driver installation
+        run: command -v tauri-driver
+
+      - name: Serve webui mock on devUrl port (5701)
+        run: |
+          python3 -m http.server 5701 --directory webui/dist &
+          echo $! > /tmp/webui-server.pid
+          timeout 15 bash -c 'until curl -sf http://localhost:5701 > /dev/null; do sleep 0.5; done'
+          echo "webui mock server ready on port 5701"
+
+      - name: Install E2E test dependencies
+        run: cd tauri/e2e && npm ci
+
+      - name: Run E2E tests (smoke + chat flow)
+        run: xvfb-run --auto-servernum npm --prefix tauri/e2e test
+
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--bundles app'
+          - platform: ubuntu-24.04
+            args: '--bundles appimage,deb'
+          - platform: windows-latest
+            args: '--bundles nsis'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: |
+            tauri/package-lock.json
+            webui/package-lock.json
+
+      - name: Install Tauri CLI deps
+        run: cd tauri && npm install
+
+      - name: Create placeholder sidecar for tauri-build
+        shell: bash
+        run: |
+          # tauri-build checks that externalBin paths exist at compile time.
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Windows needs .exe extension for sidecar
+            touch "tauri/bins/rig-server-${TRIPLE}.exe"
+          else
+            touch "tauri/bins/rig-server-${TRIPLE}"
+          fi
+
+      - name: Install webui deps and build
+        run: cd webui && npm install && npm run build
+
+      - name: Create placeholder icons for tauri::generate_context!
+        shell: bash
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Generate Tauri icons
+        shell: bash
+        run: cd tauri && npm run tauri icon app-icon.png || true
+
+      - name: Fix ICO for Windows Resource Compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # tauri icon may produce PNG-inside-ICO which Windows RC rejects (RC2176).
+          # Regenerate as BMP-based ICO that RC can compile.
+          python3 -c "
+          import struct
+          s = 32
+          bpp = 32
+          px = s * s * 4
+          mask = ((s + 31) // 32) * 4 * s
+          bmp = struct.pack('<IiiHHIIiiII', 40, s, s*2, 1, bpp, 0, px + mask, 0, 0, 0, 0)
+          img = bmp + (b'\x00\x80\x00\xff' * s * s) + (b'\x00' * mask)
+          hdr = struct.pack('<HHH', 0, 1, 1)
+          entry = struct.pack('<BBBBHHII', s, s, 0, 0, 1, bpp, len(img), 22)
+          open('tauri/src-tauri/icons/icon.ico', 'wb').write(hdr + entry + img)
+          "
+
+      - name: Build the app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: tauri
+          args: ${{ matrix.args }}
+
+  build-sidecar:
+    name: Build sidecar (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y python3-dev build-essential libffi-dev
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'poetry'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          make build
+          poetry install --extras server --extras pyinstaller --with dev
+
+      - name: Build PyInstaller executable
+        shell: bash
+        run: make build-server-exe
+
+      - name: Place sidecar with Rust target triple
+        shell: bash
+        run: |
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp dist/rig-server.exe "tauri/bins/rig-server-${TRIPLE}.exe"
+          else
+            cp dist/rig-server "tauri/bins/rig-server-${TRIPLE}"
+          fi
+
+      - name: Upload sidecar artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sidecar-${{ matrix.os }}
+          path: tauri/bins/rig-server-*
+          overwrite: true
+
+  release:
+    name: Release (${{ matrix.platform }})
+    # Require lint/test/build to pass, but tolerate partial build-sidecar failures
+    # (e.g. Windows sidecar fails but Linux/macOS succeed). Each release platform
+    # only needs its own sidecar — download-artifact grabs whatever's available.
+    if: >-
+      !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.build.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
+    needs: [lint, test, build, build-sidecar]
+    environment: tauri-autoupdater-signing
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      HAS_TAURI_SIGNING: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+          - platform: ubuntu-24.04
+            args: ''
+          - platform: windows-latest
+            args: '--bundles nsis'
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: |
+            tauri/package-lock.json
+            webui/package-lock.json
+
+      - name: Install Tauri CLI deps
+        run: cd tauri && npm install
+
+      - name: Install webui deps and build
+        run: cd webui && npm install && npm run build
+
+      - name: Download sidecar binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sidecar-*
+          merge-multiple: true
+          path: tauri/bins
+
+      - name: Fix sidecar permissions
+        shell: bash
+        run: chmod +x tauri/bins/rig-server-* || true
+
+      - name: Create placeholder icons for tauri::generate_context!
+        shell: bash
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Generate Tauri icons
+        shell: bash
+        run: cd tauri && npm run tauri icon app-icon.png || true
+
+      - name: Fix ICO for Windows Resource Compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python3 -c "
+          import struct
+          s = 32
+          bpp = 32
+          px = s * s * 4
+          mask = ((s + 31) // 32) * 4 * s
+          bmp = struct.pack('<IiiHHIIiiII', 40, s, s*2, 1, bpp, 0, px + mask, 0, 0, 0, 0)
+          img = bmp + (b'\x00\x80\x00\xff' * s * s) + (b'\x00' * mask)
+          hdr = struct.pack('<HHH', 0, 1, 1)
+          entry = struct.pack('<BBBBHHII', s, s, 0, 0, 1, bpp, len(img), 22)
+          open('tauri/src-tauri/icons/icon.ico', 'wb').write(hdr + entry + img)
+          "
+
+      # macOS code signing setup
+      - name: Import Apple Developer Certificate (macOS)
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "Warning: Apple signing certificates not available. Building without code signing."
+            exit 0
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | head -n 1)
+          SIGNING_IDENTITY=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+
+      - name: Codesign sidecar binary (macOS)
+        if: matrix.platform == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          # Tauri only signs the .app bundle, not sidecar binaries.
+          # macOS Gatekeeper rejects unsigned binaries inside signed apps,
+          # so we must codesign the PyInstaller-built sidecar before bundling.
+          # Entitlements allow JIT and unsigned memory access (required by PyInstaller).
+          # See: https://github.com/tauri-apps/tauri/discussions/2269
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          SIDECAR="tauri/bins/rig-server-${TRIPLE}"
+          if [ -f "$SIDECAR" ]; then
+            echo "Signing sidecar: $SIDECAR"
+            codesign --force --options runtime --timestamp \
+              --entitlements tauri/entitlements.plist \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              "$SIDECAR"
+            codesign --verify --verbose "$SIDECAR"
+          else
+            echo "Warning: Sidecar not found at $SIDECAR, skipping codesign"
+            ls -la tauri/bins/ || true
+          fi
+
+      - name: Set Tauri bundle version from release tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          export VERSION="${TAG#v}"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          pep440_version = os.environ["VERSION"]
+
+          def pep440_to_semver(version: str) -> str:
+              patterns = [
+                  (r"^(\d+\.\d+\.\d+)\.dev(\d+)$", "dev"),
+                  (r"^(\d+\.\d+\.\d+)\.(a|b|rc)(\d+)$", None),
+                  (r"^(\d+\.\d+\.\d+)(a|b|rc)(\d+)$", None),
+              ]
+              for pattern, fixed_label in patterns:
+                  match = re.match(pattern, version)
+                  if not match:
+                      continue
+                  base = match.group(1)
+                  label = fixed_label or match.group(2)
+                  number = match.group(2 if fixed_label else 3)
+                  return f"{base}-{label}.{number}"
+              return version
+
+          semver_version = pep440_to_semver(pep440_version)
+
+          version_pattern = re.compile(
+              r'(^\s*"version"\s*:\s*")[^"]+(",?$)',
+              flags=re.MULTILINE,
+          )
+          json_paths = [Path("tauri/src-tauri/tauri.conf.json"), Path("tauri/package.json")]
+          for path in json_paths:
+              original = path.read_text()
+              data = json.loads(original)
+              if "version" not in data:
+                  raise RuntimeError(f"Missing version field in {path}")
+              if not version_pattern.search(original):
+                  raise RuntimeError(f"Failed to locate version field in {path}")
+              updated = version_pattern.sub(rf'\g<1>{semver_version}\2', original, count=1)
+              path.write_text(updated)
+
+          cargo = Path("tauri/src-tauri/Cargo.toml")
+          cargo_text = cargo.read_text()
+          cargo_pattern = re.compile(r'^version = ".*"$', flags=re.MULTILINE)
+          if not cargo_pattern.search(cargo_text):
+              raise RuntimeError("Failed to locate Cargo.toml version")
+          cargo_updated = cargo_pattern.sub(f'version = "{semver_version}"', cargo_text, count=1)
+          cargo.write_text(cargo_updated)
+
+          print(f"Release tag version: {pep440_version}")
+          print(f"Tauri semver version: {semver_version}")
+          PY
+
+      # Resolve the existing GitHub release (created by release.yml with a
+      # proper changelog) and pass its ID to tauri-action. With releaseId,
+      # tauri-action only uploads assets; with tagName/releaseName/releaseBody,
+      # tauri-action@v1 PATCHes existing published releases and overwrites the
+      # changelog with the placeholder body (regression vs @v0, which left
+      # existing releases untouched).
+      - name: Resolve release ID
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if ! RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq '.id'); then
+            echo "::error::No GitHub release found for tag ${TAG}. The release must be created first (release.yml does this before triggering builds)."
+            exit 1
+          fi
+          echo "id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Set updater artifacts arg
+        id: updater
+        shell: bash
+        run: |
+          # Only pass createUpdaterArtifacts when the signing key is present.
+          # Without it, Tauri requires a signing key to produce signed update artifacts.
+          if [ "$HAS_TAURI_SIGNING" = "true" ]; then
+            echo 'extra=--config {"bundle":{"createUpdaterArtifacts":true}}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'extra=' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish release (signed macOS)
+        if: matrix.platform == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: tauri
+          releaseId: ${{ steps.release.outputs.id }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.extra }}
+
+      - name: Build and publish release (unsigned/fallback)
+        if: matrix.platform != 'macos-latest' || env.HAS_APPLE_SIGNING != 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: tauri
+          releaseId: ${{ steps.release.outputs.id }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.extra }}
+
+      - name: Patch AppImage libgpg-error dependency
+        if: matrix.platform == 'ubuntu-24.04'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APPIMAGE=$(find tauri/src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)
+          if [[ -n "$APPIMAGE" ]]; then
+            TAG="${{ inputs.tag || github.ref_name }}"
+            ASSET_NAME=$(basename "$APPIMAGE")
+            # Patch first so a failed patch never leaves the release with no asset
+            bash tauri/scripts/build-appimage.sh --patch-only
+            # Replace the release asset only after patching succeeds
+            ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+              --jq ".assets[] | select(.name == \"$ASSET_NAME\") | .id" 2>/dev/null || true)
+            if [[ -n "$ASSET_ID" ]]; then
+              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+            fi
+            gh release upload --clobber "$TAG" "$APPIMAGE"
+          fi
+
+  build-android:
+    name: Build Android (APK/AAB)
+    # Only aarch64 for PR/push checks; full multi-arch on release tags
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Android NDK 27
+        run: |
+          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> $GITHUB_ENV
+
+      - name: Set up Rust with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: |
+            tauri/package-lock.json
+            webui/package-lock.json
+
+      - name: Install Tauri CLI deps
+        run: cd tauri && npm install
+
+      - name: Install webui deps and build
+        run: cd webui && npm install && npm run build
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Build Android APK (aarch64 only for CI checks)
+        if: "!startsWith(github.ref, 'refs/tags/v') && inputs.tag == ''"
+        run: cd tauri && npm run tauri android build -- --apk --target aarch64
+        env:
+          NDK_HOME: ${{ env.NDK_HOME }}
+
+      - name: Build Android APK + AAB (all arches for release)
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        run: cd tauri && npm run tauri android build -- --apk --aab
+        env:
+          NDK_HOME: ${{ env.NDK_HOME }}
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-build
+          path: |
+            tauri/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            tauri/src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+          overwrite: true
+
+  release-android:
+    name: Release Android
+    if: >-
+      !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.build-android.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
+    needs: [lint, test, build, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-build
+          path: android-dist
+
+      - name: Upload APK/AAB to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # Rename gradle's generic output names (app-universal-release-unsigned.apk)
+          # to match the desktop bundle naming (rig-tauri_X.Y.Z_<arch>.<ext>),
+          # e.g. rig-tauri_0.32.0_universal-unsigned.apk. The "-release" build-type
+          # marker is dropped; "-unsigned" is kept since the APK isn't signed yet.
+          VERSION="${TAG#v}"
+          find android-dist -name "*.apk" -o -name "*.aab" | while read -r f; do
+            new="$(basename "$f" | sed -E "s/^app-/rig-tauri_${VERSION}_/; s/-release//")"
+            mv "$f" "$(dirname "$f")/$new"
+            echo "Uploading $new"
+            gh release upload "$TAG" "$(dirname "$f")/$new" --clobber
+          done

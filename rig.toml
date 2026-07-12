@@ -1,0 +1,46 @@
+prompt = "This is rig"
+files = ["README.md", "AGENTS.md", "Makefile", "docs/glossary.md"]
+#files = ["README.md", "Makefile", "rig/cli.py", "docs/*.rst", "docs/*.md"]
+
+[lessons]
+dirs = ["docs/lessons"]
+
+# Unified context configuration
+#[context]
+#enabled = true  # Master switch (replaces RIG_FRESH)
+
+#[context.selector]
+#enabled = true
+#strategy = "hybrid"
+#max_candidates = 30
+
+#[rag]
+#enabled = true
+
+#[plugins]
+#paths = [
+#    # Add your local plugin paths here
+#    # Example: "../rig-contrib/plugins/consortium"
+#]
+
+[mcp]
+enabled = true
+auto_start = true
+
+#[[mcp.servers]]
+#name = "notion"
+#command = "npx"
+#args = [
+#    "-y",
+#    "mcp-remote",
+#    "https://mcp.notion.com/mcp"
+#]
+
+#[[mcp.servers]]
+#name = "linear"
+#command = "npx"
+#args = [
+#    "-y",
+#    "mcp-remote",
+#    "https://mcp.linear.app/mcp"
+#]

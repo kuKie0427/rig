@@ -1,0 +1,582 @@
+import { Button } from '@/components/ui/button';
+import { useState, useEffect, type CSSProperties } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useApi } from '@/contexts/ApiContext';
+import { useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { use$, useObservable } from '@legendapp/state/react';
+import { ChatInput, type ChatOptions } from '@/components/ChatInput';
+import { History, Server, Copy, RotateCcw } from 'lucide-react';
+import { useSettings } from '@/contexts/SettingsContext';
+import { ExamplesSection } from '@/components/ExamplesSection';
+import { serverRegistry$, getConnectedServers } from '@/stores/servers';
+import { getExamples } from '@/utils/examples';
+import { settingsModal$ } from '@/stores/settingsModal';
+import { fetchProviderConfigured } from '@/utils/providerStatus';
+import { setupWizard$ } from '@/stores/setupWizard';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { withLocalAddressSpace } from '@/utils/addressSpace';
+import { isLikelyChromeCorsPna } from '@/utils/api';
+import { isDemoMode } from '@/utils/connectionConfig';
+import { chatRoute } from '@/utils/routes';
+
+const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
+
+export const WelcomeView = () => {
+  const [inputValue, setInputValue] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('rig-draft-new') : null) || ''
+  );
+  const [hostedLoopbackReachable, setHostedLoopbackReachable] = useState(false);
+  // Persist new-chat draft to localStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (inputValue) {
+      localStorage.setItem('rig-draft-new', inputValue);
+    } else {
+      localStorage.removeItem('rig-draft-new');
+    }
+  }, [inputValue]);
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRetryingConnection, setIsRetryingConnection] = useState(false);
+  const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
+  const navigate = useNavigate();
+  const { api, isConnected$, connectionConfig, switchServer, connect } = useApi();
+  const demoMode = isDemoMode();
+  const queryClient = useQueryClient();
+  const isConnected = use$(isConnected$);
+  const lastConnectionResult = use$(api.lastConnectionResult$);
+  const providerStatusVersion = use$(setupWizard$.providerStatusVersion);
+  const registry = use$(serverRegistry$);
+  const connectedServers = getConnectedServers();
+  const activeServer = registry.servers.find((s) => s.id === registry.activeServerId);
+  const showServerPicker = connectedServers.length > 1;
+  const quickSuggestions = getExamples('welcome-suggestions', 'mixed', 4);
+  const activeServerBaseUrl = (activeServer?.baseUrl || connectionConfig.baseUrl).replace(
+    /\/+$/,
+    ''
+  );
+  const isDefaultLocalServer = DEFAULT_LOCAL_SERVER_URLS.has(activeServerBaseUrl);
+  const installCommand = `pipx install 'rig[server]'`;
+  const serverCommand = `rig-server --cors-origin='${window.location.origin}'`;
+  // Chrome 142+ Local Network Access only gates requests from a non-local page
+  // origin to a loopback/local server, so the permission hint below is only
+  // relevant when the web UI itself is served from a hosted (non-local) origin.
+  const isHostedOrigin = !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/.test(
+    window.location.origin
+  );
+  // True when the configured server URL points at a loopback address (any port),
+  // not just the two well-known defaults — used to show the LNA hint for custom ports.
+  const isActiveServerLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/.test(
+    activeServerBaseUrl
+  );
+
+  // Stable observable for ChatInput autoFocus — must not be recreated on re-renders
+  const autoFocus$ = useObservable(true);
+
+  const handleServerSwitch = async (serverId: string) => {
+    try {
+      await switchServer(serverId);
+    } catch {
+      const server = registry.servers.find((s) => s.id === serverId);
+      toast.error(`Failed to switch to "${server?.name || 'server'}"`);
+    }
+  };
+
+  const handleSend = async (message: string, options?: ChatOptions) => {
+    if ((!message.trim() && !options?.pendingFiles?.length) || !isConnected) return;
+
+    setIsSubmitting(true);
+
+    try {
+      // Create conversation with immediate placeholder and get ID
+      const conversationId = await api.createConversationWithPlaceholder(message, {
+        model: options?.model,
+        stream: options?.stream,
+        workspace: options?.workspace || '.',
+        pendingFiles: options?.pendingFiles,
+        maxTokens: options?.maxTokens,
+        temperature: options?.temperature,
+        topP: options?.topP,
+      });
+
+      // Navigate immediately - server-side creation happens in background
+      // Errors from backend are handled via toast in api.ts
+      navigate(chatRoute(conversationId));
+
+      // Invalidate conversations query to refresh the list (async, don't block)
+      queryClient.invalidateQueries({
+        queryKey: ['conversations', connectionConfig.baseUrl, isConnected$.get()],
+      });
+    } catch (error) {
+      // This only catches synchronous errors (e.g., local state issues)
+      // Server-side errors are handled in api.ts with toast notifications
+      console.error('Failed to create conversation:', error);
+      toast.error('Failed to start conversation. Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRetryConnection = async () => {
+    setIsRetryingConnection(true);
+    try {
+      await connect();
+      // connect() shows toast.success on real connection and returns silently on no-op
+    } catch {
+      // connect() already shows toast.error on failure; swallow to avoid double-toast
+    } finally {
+      setIsRetryingConnection(false);
+    }
+  };
+
+  const handleCopyServerCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(serverCommand);
+      toast.success('Start command copied to clipboard');
+    } catch {
+      toast.error('Failed to copy start command');
+    }
+  };
+
+  useEffect(() => {
+    if (!isConnected) {
+      setProviderConfigured(null);
+      return;
+    }
+
+    const controller = new AbortController();
+
+    const fetchProviderStatus = async () => {
+      try {
+        setProviderConfigured(
+          await fetchProviderConfigured(connectionConfig.baseUrl, api.authHeader, controller.signal)
+        );
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          return;
+        }
+        setProviderConfigured(null);
+      }
+    };
+
+    void fetchProviderStatus();
+
+    return () => controller.abort();
+  }, [api.authHeader, connectionConfig.baseUrl, isConnected, providerStatusVersion]);
+
+  const { settings } = useSettings();
+  // First-time users on the default local server (typically chat.rig.org) get a
+  // guided "Get started" CTA into the setup wizard instead of the raw install/
+  // settings path. Users on a custom server have already chosen their setup, so
+  // their disconnected banner is left unchanged.
+  const isFirstVisit = !settings.hasCompletedSetup;
+  const showGuidedSetup = isDefaultLocalServer && isFirstVisit && !demoMode;
+
+  // Classify the last connection failure into actionable buckets for targeted guidance.
+  const errorBucket = (() => {
+    if (!lastConnectionResult || lastConnectionResult.ok) return 'unknown';
+    const { reason, url } = lastConnectionResult;
+    if (reason === 'cors') return isLikelyChromeCorsPna(url) ? 'pna' : 'cors';
+    return reason; // 'network' | 'timeout' | 'http_error' | 'parse_error'
+  })();
+  const showHostedLoopbackCorsHint =
+    errorBucket === 'unknown' && isDefaultLocalServer && isHostedOrigin && hostedLoopbackReachable;
+
+  useEffect(() => {
+    if (
+      demoMode ||
+      isConnected ||
+      isFirstVisit ||
+      !isDefaultLocalServer ||
+      !isHostedOrigin ||
+      errorBucket !== 'unknown'
+    ) {
+      setHostedLoopbackReachable(false);
+      return;
+    }
+
+    const probeUrl = `${activeServerBaseUrl}/api/v2`;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 2500);
+    let cancelled = false;
+
+    const runProbe = async () => {
+      try {
+        // First try a regular CORS fetch. If it succeeds, CORS is already configured
+        // and the hint would be a false positive — connect directly instead.
+        try {
+          await fetch(probeUrl, { cache: 'no-store', signal: controller.signal });
+          if (!cancelled) void connect(); // CORS is already configured; auto-connect
+          return;
+        } catch {
+          if (controller.signal.aborted || cancelled) return;
+        }
+        // CORS fetch failed; probe with no-cors to confirm the server is running at all.
+        // If this succeeds the server is up but not yet allowing cross-origin requests.
+        await fetch(
+          probeUrl,
+          withLocalAddressSpace(probeUrl, {
+            mode: 'no-cors',
+            cache: 'no-store',
+            signal: controller.signal,
+          })
+        );
+        if (!cancelled) setHostedLoopbackReachable(true);
+      } catch {
+        if (!cancelled) setHostedLoopbackReachable(false);
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
+    runProbe();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [
+    activeServerBaseUrl,
+    connect,
+    demoMode,
+    errorBucket,
+    isConnected,
+    isDefaultLocalServer,
+    isFirstVisit,
+    isHostedOrigin,
+  ]);
+
+  const disconnectedDesc = (() => {
+    if (errorBucket === 'network') {
+      return isDefaultLocalServer
+        ? 'The rig server is not running. Start one with the command below.'
+        : 'Connection refused — check that the server is running and the URL is correct.';
+    }
+    if (errorBucket === 'pna') {
+      return `Chrome blocked this connection (Local Network Access). Click Allow if a permission prompt appeared, then retry. If no prompt appeared, try opening ${activeServerBaseUrl} directly in your browser first.`;
+    }
+    if (errorBucket === 'cors') {
+      return `The server rejected cross-origin requests from ${window.location.origin}. Restart it with --cors-origin to allow this page.`;
+    }
+    if (errorBucket === 'timeout') {
+      return 'The connection timed out — the server may be starting up or unreachable. Retry in a moment.';
+    }
+    if (showHostedLoopbackCorsHint) {
+      return `The local rig server appears to be running, but it is not allowing requests from ${window.location.origin} yet. Restart it with --cors-origin to allow this page.`;
+    }
+    return isDefaultLocalServer
+      ? 'Start a local rig server or point the app at another server before starting a chat.'
+      : 'Check the server URL and auth token, then retry the connection.';
+  })();
+
+  const bg = settings.welcomeBackground;
+  // Determine if the background is an image URL or a CSS gradient/color
+  const isImageBg = bg && (bg.startsWith('http') || bg.startsWith('/') || bg.startsWith('data:'));
+  const bgStyle: CSSProperties = bg
+    ? isImageBg
+      ? { backgroundImage: `url("${bg}")`, backgroundSize: 'cover', backgroundPosition: 'center' }
+      : { background: bg }
+    : {};
+  const hasCustomBg = !!bg;
+
+  return (
+    <div className="mx-auto flex h-full w-full flex-col" style={bgStyle}>
+      <div className="mx-auto flex h-full w-full max-w-5xl flex-col items-center justify-center px-4 pt-12 sm:px-6">
+        <div
+          className={`w-full max-w-4xl rounded-[28px] border p-6 shadow-[0_30px_120px_-48px_rgba(15,23,42,0.45)] sm:p-8 ${
+            hasCustomBg
+              ? 'border-white/20 bg-background/60 backdrop-blur-xl'
+              : 'border-border/70 bg-background/90 backdrop-blur'
+          }`}
+        >
+          <div className="flex flex-col gap-8">
+            <div className="space-y-4 text-center">
+              <div className="space-y-3">
+                <h1 className="text-3xl font-semibold tracking-tight text-foreground/90 sm:text-5xl">
+                  What are you working on?
+                </h1>
+                <p className="mx-auto max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
+                  Start with a real task, question, or rough idea. rig is best when you give it
+                  something concrete to work on.
+                </p>
+              </div>
+            </div>
+
+            {!isConnected && (
+              <Alert className="mx-auto w-full max-w-2xl border-amber-500/30 bg-amber-500/10 text-left">
+                <Server className="h-4 w-4 text-amber-700 dark:text-amber-300" />
+                <AlertTitle>
+                  {showHostedLoopbackCorsHint || (isDefaultLocalServer && errorBucket === 'cors')
+                    ? 'Local rig server needs browser access'
+                    : isDefaultLocalServer
+                      ? 'No rig server connected'
+                      : `Cannot reach ${activeServer?.name || 'the configured server'}`}
+                </AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>{disconnectedDesc}</p>
+                  {(errorBucket === 'cors' || showHostedLoopbackCorsHint) && (
+                    <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                      {serverCommand}
+                    </code>
+                  )}
+                  {errorBucket !== 'pna' &&
+                    !isDefaultLocalServer &&
+                    isHostedOrigin &&
+                    isActiveServerLoopback && (
+                      <p className="text-xs text-muted-foreground">
+                        On Chrome 142+ (and other Chromium browsers), connecting from a hosted page
+                        to a local server triggers a{' '}
+                        <span className="font-medium">Local Network Access</span> permission prompt
+                        — click <span className="font-medium">Allow</span> if you see one. The{' '}
+                        <code>--cors-origin</code> flag alone is not enough.
+                      </p>
+                    )}
+                  {showGuidedSetup && (
+                    <p className="text-sm text-muted-foreground">
+                      New to rig? The setup guide walks you through installing a local server or
+                      using the managed rig.ai option — no copy-pasting required.
+                    </p>
+                  )}
+                  {isDefaultLocalServer &&
+                    !isFirstVisit &&
+                    errorBucket !== 'cors' &&
+                    !showHostedLoopbackCorsHint && (
+                      <div className="space-y-2">
+                        <p className="text-xs text-muted-foreground">
+                          New to rig? Install it, then start a server:
+                        </p>
+                        <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                          {installCommand}
+                        </code>
+                        <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                          {serverCommand}
+                        </code>
+                        {errorBucket !== 'pna' && isHostedOrigin && (
+                          <p className="text-xs text-muted-foreground">
+                            On Chrome 142+ (and other Chromium browsers), the first connection to a
+                            local server also triggers a{' '}
+                            <span className="font-medium">Local Network Access</span> permission
+                            prompt. Click <span className="font-medium">Allow</span> so this page
+                            can reach <code>localhost</code> — the <code>--cors-origin</code> flag
+                            alone is not enough.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  <div className="flex flex-wrap gap-2">
+                    {showGuidedSetup && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => {
+                          setupWizard$.step.set('welcome');
+                          setupWizard$.open.set(true);
+                        }}
+                      >
+                        Get started
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void handleRetryConnection()}
+                      disabled={isRetryingConnection}
+                    >
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      {isRetryingConnection ? 'Retrying...' : 'Retry connection'}
+                    </Button>
+                    {isDefaultLocalServer && !isFirstVisit && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleCopyServerCommand()}
+                      >
+                        <Copy className="mr-2 h-4 w-4" />
+                        Copy start command
+                      </Button>
+                    )}
+                    {!showGuidedSetup && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
+                      >
+                        Server settings
+                      </Button>
+                    )}
+                  </div>
+                  {isDefaultLocalServer && !isFirstVisit && (
+                    <p className="text-sm text-muted-foreground">
+                      Prefer not to run a local server?{' '}
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0 text-sm"
+                        onClick={() => {
+                          setupWizard$.step.set('cloud');
+                          setupWizard$.open.set(true);
+                        }}
+                      >
+                        Use rig.ai
+                      </Button>{' '}
+                      for a managed option — no install required.
+                    </p>
+                  )}
+                  {isHostedOrigin && !demoMode && (
+                    <p className="text-sm text-muted-foreground">
+                      Just want to see what rig can do?{' '}
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0 text-sm"
+                        onClick={() => {
+                          const url = new URL(window.location.href);
+                          url.searchParams.set('demo', '1');
+                          window.location.href = url.toString();
+                        }}
+                      >
+                        Try the offline demo
+                      </Button>{' '}
+                      — no install or account required.
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Need help connecting?{' '}
+                    <a
+                      href="https://rig.org/docs/server.html"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-medium underline underline-offset-2 hover:text-foreground"
+                    >
+                      Read the server setup guide
+                    </a>
+                    .
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {isConnected && providerConfigured === false && (
+              <Alert className="mx-auto w-full max-w-2xl border-sky-500/30 bg-sky-500/10 text-left">
+                <Server className="h-4 w-4 text-sky-700 dark:text-sky-300" />
+                <AlertTitle>Provider setup required</AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    This server is reachable, but it does not have an LLM provider configured yet.
+                    Finish setup to add an API key or switch to rig.ai before starting a chat.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        setupWizard$.step.set('provider');
+                        setupWizard$.open.set(true);
+                      }}
+                    >
+                      Finish setup
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
+                    >
+                      Server settings
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div className="mx-auto w-full max-w-2xl [&_textarea]:min-h-[80px] [&_textarea]:text-base">
+              <ChatInput
+                onSend={handleSend}
+                autoFocus$={autoFocus$}
+                value={inputValue}
+                onChange={setInputValue}
+              />
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-center text-xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
+                Try one of these
+              </p>
+              <div className="flex flex-wrap justify-center gap-2">
+                {quickSuggestions.map((suggestion) => (
+                  <Button
+                    key={suggestion}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="rounded-full border-border/70 bg-background/70 text-xs text-muted-foreground hover:bg-background hover:text-foreground"
+                    onClick={() => setInputValue(suggestion)}
+                    disabled={isSubmitting}
+                  >
+                    {suggestion}
+                  </Button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              {showServerPicker && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="rounded-full border border-transparent text-muted-foreground hover:border-border/70 hover:bg-background/70"
+                    >
+                      <Server className="mr-2 h-4 w-4" />
+                      {activeServer?.name || 'Server'}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent>
+                    {connectedServers.map((server) => (
+                      <DropdownMenuItem
+                        key={server.id}
+                        onClick={() => handleServerSwitch(server.id)}
+                      >
+                        <span
+                          className={server.id === registry.activeServerId ? 'font-medium' : ''}
+                        >
+                          {server.name}
+                        </span>
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => navigate('/history')}
+                className="rounded-full border border-transparent text-muted-foreground hover:border-border/70 hover:bg-background/70"
+              >
+                <History className="mr-2 h-4 w-4" />
+                Show history
+              </Button>
+              <ExamplesSection onExampleSelect={setInputValue} disabled={isSubmitting} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

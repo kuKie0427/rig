@@ -1,0 +1,395 @@
+"""Agent profiles for pre-configured system prompts and tool access.
+
+Profiles combine:
+- System prompt customization (behavioral guidance)
+- Tool access restrictions (hard-enforced when used via subagent tool)
+- Behavior rules (read-only, no-network, etc.)
+
+Tool restrictions are hard-enforced in subagent thread mode: only allowed
+tools are loaded into the execution context, so the LLM cannot call
+restricted tools even if it tries. CLI mode (--agent-profile) also
+hard-enforces via the tool allowlist. Behavior rules (read_only, no_network)
+remain soft/prompting-based.
+
+This enables creating specialized agents like "explorer" (read-only),
+"researcher" (web access), or "developer" (full capabilities).
+
+User profiles can be defined in ~/.config/rig/profiles/ as either:
+- TOML files (.toml): Traditional key-value format
+- Markdown files (.md): YAML frontmatter for metadata, body as system_prompt
+"""
+
+import logging
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+try:
+    import yaml
+
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+from .dirs import get_config_dir
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProfileBehavior:
+    """Behavior rules for a profile."""
+
+    confirm_writes: bool = False
+    read_only: bool = False
+    no_network: bool = False
+
+
+@dataclass
+class Profile:
+    """Agent profile combining system prompt, tools, and behavior rules.
+
+    Attributes:
+        name: Unique profile identifier
+        description: Human-readable description
+        system_prompt: Additional system prompt text (appended to base)
+        tools: List of allowed tools (None = all tools, empty = no tools)
+        behavior: Behavior rules for the profile
+    """
+
+    name: str
+    description: str
+    system_prompt: str = ""
+    tools: list[str] | None = None
+    behavior: ProfileBehavior = field(default_factory=ProfileBehavior)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Profile":
+        """Create a Profile from a dictionary (e.g., TOML config).
+
+        Note: This method does not mutate the input dictionary.
+        """
+        behavior_data = data.get("behavior", {})
+        behavior = ProfileBehavior(**behavior_data)
+        profile_data = {k: v for k, v in data.items() if k != "behavior"}
+
+        # Validate tools field type: must be a list or None
+        tools = profile_data.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            raise TypeError(
+                f"Profile '{data.get('name', '?')}': "
+                f"'tools' must be a list (e.g. ['read', 'shell']), got {type(tools).__name__}"
+            )
+
+        return cls(behavior=behavior, **profile_data)
+
+    def validate_tools(self, available_tool_names: set[str]) -> list[str]:
+        """Validate that profile tool names exist in the available tools.
+
+        Returns list of unknown tool names (empty if all valid).
+        """
+        if self.tools is None:
+            return []
+        return sorted(set(self.tools) - available_tool_names)
+
+
+# Built-in profiles
+BUILTIN_PROFILES: dict[str, Profile] = {
+    "default": Profile(
+        name="default",
+        description="Full capabilities - standard rig experience",
+        system_prompt="",
+        tools=None,
+        behavior=ProfileBehavior(),
+    ),
+    "explorer": Profile(
+        name="explorer",
+        description="Read-only exploration - cannot modify files or access network",
+        system_prompt=(
+            "You are in EXPLORER mode. Your purpose is to understand and analyze, "
+            "not to modify. You should:\n"
+            "- Read and analyze files to understand the codebase\n"
+            "- Search for patterns and gather information\n"
+            "- Provide insights and recommendations\n"
+            "- NOT modify any files or make changes\n"
+            "- NOT access the network or external resources\n"
+        ),
+        tools=["read", "chats"],
+        behavior=ProfileBehavior(read_only=True, no_network=True),
+    ),
+    "researcher": Profile(
+        name="researcher",
+        description="Web research - can browse but not modify local files",
+        system_prompt=(
+            "You are in RESEARCHER mode. Your purpose is to gather information "
+            "from the web and provide analysis. You should:\n"
+            "- Browse websites and search for information\n"
+            "- Analyze and synthesize findings\n"
+            "- Provide well-sourced answers\n"
+            "- NOT modify local files (reports via output only)\n"
+        ),
+        tools=["browser", "read", "screenshot", "chats"],
+        behavior=ProfileBehavior(read_only=True),
+    ),
+    "developer": Profile(
+        name="developer",
+        description="Full development capabilities",
+        system_prompt=(
+            "You are in DEVELOPER mode with full capabilities to:\n"
+            "- Read, write, and modify files\n"
+            "- Execute shell commands\n"
+            "- Run code and tests\n"
+            "- Use all available tools\n"
+        ),
+        tools=None,
+        behavior=ProfileBehavior(),
+    ),
+    "isolated": Profile(
+        name="isolated",
+        description="Isolated processing - no file writes or network (for untrusted content)",
+        system_prompt=(
+            "You are in ISOLATED mode for processing potentially untrusted content. "
+            "You have restricted capabilities:\n"
+            "- Read-only file access\n"
+            "- No network access\n"
+            "- No file modifications\n"
+            "- Analyze and report only\n"
+        ),
+        tools=["read", "ipython"],
+        behavior=ProfileBehavior(read_only=True, no_network=True),
+    ),
+    "computer-use": Profile(
+        name="computer-use",
+        description="Computer-use specialist: structured-first for web, screenshots for native/visual",
+        system_prompt=(
+            "You are in COMPUTER-USE mode, specialized for UI automation and desktop interaction.\n"
+            "\n"
+            "## Backend selection policy (structured-first, screenshot fallback)\n"
+            "\n"
+            "**Web targets with Playwright available** → prefer structured browser interaction:\n"
+            "- Use `observe_web(url)` as the single-call shortcut: it calls snapshot_url internally and optionally appends a screenshot — lower boilerplate than calling each piece separately\n"
+            "- Use `open_page(url)` when you need stateful navigation across multiple steps\n"
+            "- Use `snapshot_url(url)` for DOM-addressable pages: it avoids vision-token cost and gives you a structured ARIA tree to query directly\n"
+            "- Use `click_element(selector)` and `fill_element(selector, value)` when you want precise, reproducible DOM interaction instead of coordinate guesses\n"
+            "- Use `read_page_text()` when the content matters more than the pixels\n"
+            "\n"
+            "**Visual verification or non-DOM surfaces** → use screenshot path:\n"
+            "- Use `observe_desktop()` as the single-call shortcut for taking a screenshot with intent — equivalent to `computer('screenshot')` but signals your observation purpose\n"
+            "- Use `computer('screenshot')` when the answer depends on rendered pixels, canvas output, or browser chrome that the DOM will not expose\n"
+            "- Use `act_and_observe(action, ...)` for the complete 'act then look' cycle in one call — it runs the action then waits for the screen to settle and returns a screenshot automatically\n"
+            "- Use `computer('wait_for_change')` when you need more control (e.g. longer timeouts) than `act_and_observe`'s 3-second default\n"
+            "\n"
+            "**Native desktop / X11 / non-browser apps** → prefer accessibility-first, then coordinates:\n"
+            "- Use `computer('accessibility_tree')` to inspect available elements (role, name) without taking a screenshot (Linux/AT-SPI2 only)\n"
+            "- Use `computer('click_accessible_element', text='push button:Submit')` to click by role+name — robust against window size/position changes\n"
+            "- Fall back to `computer('left_click', coordinate=(x, y))` only when the app lacks accessibility support (games, canvas UIs, electron apps)\n"
+            "- Use `act_and_observe('window_focus', text='pattern')` (not bare `computer('window_focus', ...)`) before acting on newly-opened windows — the automatic `wait_for_change` ensures the app has rendered its UI before you type\n"
+            "- Use `computer('scroll', coordinate=(x,y), text='down')` when the interface is only exposed through a native viewport\n"
+            "- Use `computer('triple_click', coordinate=(x, y))` to select all text in a native field before replacing it\n"
+            "- Use `fill_native((x, y), text)` as a single-call shortcut to replace text in a native field — equivalent to `fill_element(selector, value)` for DOM targets\n"
+            "\n"
+            "## Efficiency rules\n"
+            "- Use `observe_web(url)` for web — structured ARIA snapshot with no vision tokens\n"
+            "- Use `observe_desktop()` for desktop — explicit screenshot with intent signal\n"
+            "- Use `act_and_observe(action, ...)` for the act-then-look loop — one call, no polling\n"
+            "- Use `wait_for_change` after triggering UI actions when you need a longer timeout — never poll with repeated screenshots\n"
+            "- Keep screenshot loops focused: take one screenshot, act, take one to verify\n"
+            "- When used as a subagent, summarize key findings to keep parent context lean\n"
+            "\n"
+            "## Output format\n"
+            "Return structured findings with: observed state, actions taken, result, evidence\n"
+            "(screenshot path or ARIA snapshot). Avoid unnecessary file modifications.\n"
+        ),
+        # browser included for structured-first web interaction (snapshot_url, open_page, etc.)
+        tools=["computer", "browser", "vision", "ipython", "shell"],
+        behavior=ProfileBehavior(),
+    ),
+    "browser-use": Profile(
+        name="browser-use",
+        description="Browser-use specialist for web interaction and testing",
+        system_prompt=(
+            "You are in BROWSER-USE mode, specialized for web browsing and "
+            "interaction. Prioritize efficient, evidence-first workflows:\n"
+            "\n"
+            "Two browsing modes are available:\n"
+            "- **One-shot**: read_url(url), search(query), screenshot_url(url), "
+            "snapshot_url(url) — for quick fetches without state\n"
+            "- **Interactive session**: open_page(url) to start, then "
+            "click_element(selector), fill_element(selector, value), "
+            "scroll_page(direction), read_page_text() — for multi-step "
+            "interaction with persistent page state\n"
+            "\n"
+            "Use interactive mode when you need to navigate, fill forms, or "
+            "interact with dynamic content. Use one-shot mode for simple reads.\n"
+            "\n"
+            "General guidelines:\n"
+            "- Take screenshots to verify visual state and capture evidence\n"
+            "- Prefer returning structured findings (issues, repro steps, observations)\n"
+            "- When used as a subagent, keep parent context lean by summarizing key results\n"
+            "- Avoid unnecessary file modifications unless explicitly requested\n"
+        ),
+        # ipython required: browser functions (read_url, screenshot_url, etc.) are
+        # Python functions callable via ipython, not standalone tools
+        tools=["browser", "screenshot", "vision", "ipython", "shell"],
+        behavior=ProfileBehavior(),
+    ),
+    "verifier": Profile(
+        name="verifier",
+        description="Review and verify mode — read-only analysis with reporting output",
+        system_prompt=(
+            "You are in VERIFIER mode. Your purpose is to review, verify, and "
+            "validate work done by other agents. You should:\n"
+            "- Review code, test output, and design decisions for correctness\n"
+            "- Check for edge cases, security issues, and regressions\n"
+            "- Provide structured verification reports\n"
+            "- NOT modify any files or make changes\n"
+            "- NOT access the network or external resources\n"
+            "- Use `complete` tool to return your verification report\n"
+        ),
+        tools=["read", "ipython", "shell", "chats"],
+        behavior=ProfileBehavior(read_only=True, no_network=True),
+    ),
+}
+
+
+def get_user_profiles_dir() -> Path:
+    """Get the directory for user-defined profiles."""
+    return get_config_dir() / "profiles"
+
+
+def _parse_markdown_profile(path: Path) -> Profile:
+    """Parse a markdown file with YAML frontmatter into a Profile.
+
+    Format::
+
+        ---
+        name: my-profile
+        description: A custom profile
+        tools:
+          - read
+          - shell
+        behavior:
+          read_only: false
+        ---
+
+        # My Profile
+
+        You are a specialized agent...
+
+    The YAML frontmatter contains profile metadata (name, description,
+    tools, behavior). The markdown body becomes the system_prompt.
+    """
+    if not HAS_YAML:
+        raise ImportError(
+            "PyYAML is required for markdown profiles. Install with: pip install pyyaml"
+        )
+
+    content = path.read_text(encoding="utf-8").lstrip("\ufeff")
+
+    if not content.startswith("---"):
+        raise ValueError(f"Markdown profile must start with YAML frontmatter: {path}")
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError(f"Invalid YAML frontmatter in: {path}")
+
+    frontmatter_str = parts[1]
+    body = parts[2].strip()
+
+    frontmatter = yaml.safe_load(frontmatter_str)
+    if not frontmatter or not isinstance(frontmatter, dict):
+        raise ValueError(f"Empty or invalid YAML frontmatter in: {path}")
+
+    if "name" not in frontmatter:
+        raise ValueError(f"Markdown profile missing required 'name' field: {path}")
+    if "description" not in frontmatter:
+        raise ValueError(
+            f"Markdown profile missing required 'description' field: {path}"
+        )
+
+    # Build profile data dict: frontmatter fields + body as system_prompt
+    data = dict(frontmatter)
+    data["system_prompt"] = body
+
+    return Profile.from_dict(data)
+
+
+def _load_toml_profiles(profiles_dir: Path) -> dict[str, Profile]:
+    """Load profiles from TOML files in a directory."""
+    profiles: dict[str, Profile] = {}
+
+    for profile_file in profiles_dir.glob("*.toml"):
+        try:
+            with open(profile_file, "rb") as f:
+                data = tomllib.load(f)
+
+            profile = Profile.from_dict(data)
+            profiles[profile.name] = profile
+            logger.debug("Loaded TOML profile: %s from %s", profile.name, profile_file)
+        except Exception as e:
+            logger.warning("Failed to load TOML profile %s: %s", profile_file, e)
+
+    return profiles
+
+
+def _load_markdown_profiles(profiles_dir: Path) -> dict[str, Profile]:
+    """Load profiles from markdown files with YAML frontmatter."""
+    profiles: dict[str, Profile] = {}
+
+    for profile_file in profiles_dir.glob("*.md"):
+        try:
+            profile = _parse_markdown_profile(profile_file)
+            profiles[profile.name] = profile
+            logger.debug(
+                "Loaded markdown profile: %s from %s", profile.name, profile_file
+            )
+        except Exception as e:
+            logger.warning("Failed to load markdown profile %s: %s", profile_file, e)
+
+    return profiles
+
+
+def load_user_profiles() -> dict[str, Profile]:
+    """Load user-defined profiles from config directory.
+
+    Profiles are stored as TOML (.toml) or Markdown (.md) files
+    in ~/.config/rig/profiles/. Markdown files override TOML files
+    with the same profile name.
+    """
+    profiles_dir = get_user_profiles_dir()
+
+    if not profiles_dir.exists():
+        return {}
+
+    # Load TOML first, then markdown (markdown overrides on name collision)
+    profiles = _load_toml_profiles(profiles_dir)
+    profiles.update(_load_markdown_profiles(profiles_dir))
+
+    return profiles
+
+
+def get_profile(name: str) -> Profile | None:
+    """Get a profile by name.
+
+    Checks user profiles first, then falls back to built-in profiles.
+    """
+    user_profiles = load_user_profiles()
+    if name in user_profiles:
+        return user_profiles[name]
+
+    return BUILTIN_PROFILES.get(name)
+
+
+def list_profiles() -> dict[str, Profile]:
+    """List all available profiles (built-in and user-defined).
+
+    User profiles override built-in profiles with the same name.
+    """
+    profiles = BUILTIN_PROFILES.copy()
+    profiles.update(load_user_profiles())
+    return profiles

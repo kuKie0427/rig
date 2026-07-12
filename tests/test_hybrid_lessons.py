@@ -1,0 +1,553 @@
+"""Tests for hybrid lesson matching integration."""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from rig.lessons import MatchContext
+from rig.lessons.matcher import LessonMatcher
+from rig.lessons.parser import Lesson, LessonMetadata
+
+# Check if hybrid matching is available
+try:
+    from rig.lessons.hybrid_matcher import (
+        HybridConfig,
+        HybridLessonMatcher,
+        _default_effectiveness_state_file,
+        _lesson_lookup_keys,
+        _load_effectiveness_scores,
+        _score_from_judge_arm,
+        _score_from_ts_arm,
+    )
+
+    HYBRID_AVAILABLE = True
+except ImportError:
+    HYBRID_AVAILABLE = False
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_hybrid_matcher_fallback():
+    """Test that HybridLessonMatcher falls back to keyword-only when embeddings unavailable."""
+    # This test verifies the fallback mechanism works
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+
+    # Test with empty lessons list
+    context = MatchContext(message="test query")
+    results = matcher.match([], context)
+
+    assert isinstance(results, list)
+    assert len(results) == 0
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_hybrid_config_defaults():
+    """Test that HybridConfig has sensible defaults."""
+    config = HybridConfig()
+
+    assert config.keyword_weight == 0.25
+    assert config.semantic_weight == 0.40
+    assert config.effectiveness_weight == 0.25
+    assert config.recency_weight == 0.10
+    assert config.tool_bonus == 0.20
+    assert config.top_k == 20
+    # Phase 5.5: Dynamic top-K parameters
+    assert config.min_score_threshold == 0.6
+    assert config.max_lessons == 10
+
+
+def test_backward_compatibility():
+    """Test that basic LessonMatcher still works (backward compatibility)."""
+    matcher = LessonMatcher()
+    context = MatchContext(message="test query")
+    results = matcher.match([], context)
+
+    assert isinstance(results, list)
+    assert len(results) == 0
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores(tmp_path):
+    """Test loading Thompson sampling posteriors from JSON state file."""
+    state = {
+        "arms": {
+            "git-workflow.md": {"alpha": 8.0, "beta": 2.0},
+            "python-invocation.md": {"alpha": 3.0, "beta": 7.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    assert len(posteriors) == 2
+    assert posteriors["git-workflow.md"] == pytest.approx(0.8)
+    assert posteriors["python-invocation.md"] == pytest.approx(0.3)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_missing_file():
+    """Test graceful handling of missing state file."""
+    posteriors = _load_effectiveness_scores("/nonexistent/path.json")
+    assert posteriors == {}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_zero_total_defaults_to_neutral(tmp_path):
+    """Test zero-count arms fall back to neutral 0.5 instead of crashing."""
+    state = {
+        "arms": {
+            "empty-arm.md": {"alpha": 0.0, "beta": 0.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    assert posteriors == {"empty-arm.md": 0.5}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_invalid_numeric_data_returns_empty(tmp_path):
+    """Test malformed alpha/beta values are handled gracefully."""
+    state = {
+        "arms": {
+            "bad-arm.md": {"alpha": "not-a-number", "beta": 1.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    assert posteriors == {}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_score_from_ts_arm_returns_none_without_ts_fields():
+    """Judge-only arms should not be misread as TS arms."""
+    assert _score_from_ts_arm({"helpful": 3, "harmful": 1}) is None
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_score_from_judge_arm_returns_none_without_judge_fields():
+    """TS-only arms should not be misread as judge arms."""
+    assert _score_from_judge_arm({"alpha": 2.0, "beta": 1.0}) is None
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_score_from_judge_arm_uses_false_positive_and_noop():
+    """Judge score should count both false_positive and noop as non-helpful."""
+    arm = {
+        "helpful": 3.0,
+        "harmful": 1.0,
+        "false_positive": 2.0,
+        "noop": 4.0,
+    }
+
+    # With Laplace smoothing: (helpful+1) / (total+2) = (3+1) / (10+2) = 4/12
+    assert _score_from_judge_arm(arm) == pytest.approx(4 / 12)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_non_dict_arm_skipped(tmp_path):
+    """Test non-dict arm values (e.g. scalars) are skipped without crashing."""
+    state = {
+        "arms": {
+            "bad-arm.md": 0.9,  # not a dict — would raise TypeError without guard
+            "good-arm.md": {"alpha": 8.0, "beta": 2.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    # bad-arm skipped, good-arm still parsed
+    assert "bad-arm.md" not in posteriors
+    assert posteriors.get("good-arm.md") == pytest.approx(0.8)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_judge_only_arm(tmp_path):
+    """Judge-only state files should still produce lesson effectiveness scores."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {
+                "helpful": 6.0,
+                "harmful": 2.0,
+                "false_positive": 2.0,
+            },
+        }
+    }
+    state_file = tmp_path / "judge_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    # With Laplace smoothing: (helpful+1) / (total+2) = (6+1) / (10+2) = 7/12
+    assert posteriors["workflow/git-workflow.md"] == pytest.approx(7 / 12)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_combines_ts_and_judge_scores(tmp_path):
+    """Combined state should average session-level TS and lesson-level judge signal."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {
+                "alpha": 9.0,
+                "beta": 1.0,
+                "helpful": 2.0,
+                "harmful": 2.0,
+                "noop": 2.0,
+            },
+        }
+    }
+    state_file = tmp_path / "combined_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    # TS = 0.9, judge (with Laplace) = (2+1)/(6+2) = 3/8 = 0.375, combined = avg
+    assert posteriors["workflow/git-workflow.md"] == pytest.approx((0.9 + (3 / 8)) / 2)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_with_ts(tmp_path):
+    """Test that effectiveness_score uses TS posteriors when configured."""
+    state = {
+        "arms": {
+            "git-workflow.md": {"alpha": 9.0, "beta": 1.0},  # 0.9 effectiveness
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    config = HybridConfig(
+        enable_semantic=False,
+        effectiveness_state_file=str(state_file),
+    )
+    matcher = HybridLessonMatcher(config=config)
+
+    # Verify posteriors were loaded
+    assert len(matcher._ts_posteriors) == 1
+    assert matcher._ts_posteriors["git-workflow.md"] == pytest.approx(0.9)
+
+    # Verify _effectiveness_score uses posteriors via basename lookup
+    lesson = Lesson(
+        path=Path("/tmp/lessons/git-workflow.md"),
+        metadata=LessonMetadata(),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.9)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_matches_short_path(tmp_path):
+    """Test lessons can match TS posteriors via category/filename path."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {"alpha": 7.0, "beta": 3.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    matcher = HybridLessonMatcher(
+        config=HybridConfig(
+            enable_semantic=False,
+            effectiveness_state_file=str(state_file),
+        )
+    )
+    lesson = Lesson(
+        path=Path("/tmp/lessons/workflow/git-workflow.md"),
+        metadata=LessonMetadata(),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.7)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_default(monkeypatch):
+    """Test that effectiveness_score returns 0.5 without TS config."""
+    monkeypatch.delenv("RIG_LESSONS_TS_STATE", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: Path("/nonexistent"))
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+    assert matcher._ts_posteriors == {}
+    # Verify the fallback path inside _effectiveness_score returns 0.5
+    lesson = Lesson(
+        path=Path("/tmp/lessons/some-lesson.md"),
+        metadata=LessonMetadata(),
+        title="Some Lesson",
+        description="",
+        category="workflow",
+        body="",
+    )
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.5)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_default_effectiveness_state_file_uses_env(monkeypatch):
+    """Env override should take precedence for TS state discovery."""
+    monkeypatch.setenv("RIG_LESSONS_TS_STATE", "/tmp/custom-bandit.json")
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    assert _default_effectiveness_state_file() == "/tmp/custom-bandit.json"
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_default_effectiveness_state_file_uses_xdg(monkeypatch):
+    """XDG state home should be used when env override is absent."""
+    monkeypatch.delenv("RIG_LESSONS_TS_STATE", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/xdg-state")
+
+    assert (
+        _default_effectiveness_state_file()
+        == "/tmp/xdg-state/rig/lessons/bandit-state.json"
+    )
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_lesson_lookup_keys_include_id_and_path_forms():
+    """Lookup keys should prefer explicit id and keep legacy path variants."""
+    lesson = Lesson(
+        path=Path("/tmp/lessons/workflow/git-workflow.md"),
+        metadata=LessonMetadata(id="workflow.git-workflow"),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert _lesson_lookup_keys(lesson) == [
+        "workflow.git-workflow",
+        "/tmp/lessons/workflow/git-workflow.md",
+        "git-workflow.md",
+        "workflow/git-workflow.md",
+    ]
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_matches_explicit_lesson_id(tmp_path):
+    """Explicit lesson ids should provide a stable lookup key."""
+    state = {
+        "arms": {
+            "workflow.git-workflow": {"alpha": 8.0, "beta": 2.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    matcher = HybridLessonMatcher(
+        config=HybridConfig(
+            enable_semantic=False,
+            effectiveness_state_file=str(state_file),
+        )
+    )
+    lesson = Lesson(
+        path=Path("/tmp/elsewhere/workflow/git-workflow.md"),
+        metadata=LessonMetadata(id="workflow.git-workflow"),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.8)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_semantic_score_zero_norm_returns_zero():
+    """Zero-norm embeddings should return 0.0 instead of NaN/inf."""
+    np = pytest.importorskip("numpy")
+    from unittest.mock import MagicMock
+
+    # enable_semantic=False skips real model loading; embedder is set below.
+    # _semantic_score only checks self.embedder, not config.enable_semantic.
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+
+    # Mock the embedder to return a zero vector
+    mock_embedder = MagicMock()
+    mock_embedder.encode.return_value = np.zeros(384)
+    matcher.embedder = mock_embedder
+
+    lesson = Lesson(
+        path=Path("/tmp/lessons/test-lesson.md"),
+        metadata=LessonMetadata(),
+        title="Test",
+        description="",
+        category="test",
+        body="test body",
+    )
+    context = MatchContext(message="test query")
+    query_embed = np.zeros(384)  # Zero-norm query embedding
+
+    score = matcher._semantic_score(query_embed, lesson, context)
+    assert score == 0.0
+    assert not np.isnan(score)
+    assert not np.isinf(score)
+
+
+def test_semantic_score_uses_description_field():
+    """_semantic_score must encode the description field, not body, for retrieval precision."""
+    np = pytest.importorskip("numpy")
+    from unittest.mock import MagicMock
+
+    # enable_semantic=False skips real model loading; embedder is set below.
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+
+    mock_embedder = MagicMock()
+    mock_embedder.encode.return_value = np.ones(384) / np.sqrt(384)
+    matcher.embedder = mock_embedder
+
+    frontmatter_desc = "Use when saving insights so they persist across sessions"
+    lesson_with_frontmatter_desc = Lesson(
+        path=Path("/tmp/lessons/persistent-learning.md"),
+        metadata=LessonMetadata(description=frontmatter_desc),
+        title="Persistent Learning",
+        description="Extracted first paragraph description",
+        category="patterns",
+        body="## Rule\nAlways persist insights.\n\n```python\n# code example\n```",
+    )
+
+    query_embed = np.ones(384) / np.sqrt(384)
+    context = MatchContext(message="I should save this as a lesson")
+    matcher._semantic_score(query_embed, lesson_with_frontmatter_desc, context)
+
+    # Must encode frontmatter description (not body content)
+    encoded_text = mock_embedder.encode.call_args[0][0]
+    assert frontmatter_desc in encoded_text
+    assert "## Rule" not in encoded_text  # body content must NOT appear
+
+    # Fallback to extracted description when frontmatter description is absent
+    mock_embedder.reset_mock()
+    mock_embedder.encode.return_value = np.ones(384) / np.sqrt(384)
+    lesson_no_frontmatter_desc = Lesson(
+        path=Path("/tmp/lessons/other.md"),
+        metadata=LessonMetadata(),  # no description in frontmatter
+        title="Other Lesson",
+        description="Extracted paragraph: use when doing X",
+        category="tools",
+        body="## Rule\nDo this.\n\n```bash\ncode\n```",
+    )
+    matcher._semantic_score(query_embed, lesson_no_frontmatter_desc, context)
+    encoded_text = mock_embedder.encode.call_args[0][0]
+    assert "Extracted paragraph" in encoded_text
+    assert "## Rule" not in encoded_text
+
+    # Fallback to body[:500] when both descriptions are absent — prevents title-only embedding
+    mock_embedder.reset_mock()
+    mock_embedder.encode.return_value = np.ones(384) / np.sqrt(384)
+    lesson_no_desc = Lesson(
+        path=Path("/tmp/lessons/no-desc.md"),
+        metadata=LessonMetadata(),  # no frontmatter description
+        title="No Description Lesson",
+        description="",  # extracted description also empty
+        category="tools",
+        body="## Rule\nDo the right thing.\n\n```bash\necho ok\n```",
+    )
+    matcher._semantic_score(query_embed, lesson_no_desc, context)
+    encoded_text = mock_embedder.encode.call_args[0][0]
+    assert "## Rule" in encoded_text  # body content must appear as last resort
+    assert "No Description Lesson" in encoded_text  # title still present
+
+
+def test_semantic_score_caches_lesson_embeddings():
+    """A lesson's embedding is encoded once and reused across turns.
+
+    Matching runs every turn, but lesson text is static, so re-encoding the same
+    candidate each turn is wasted compute. The cache must avoid that while still
+    returning the correct score.
+    """
+    np = pytest.importorskip("numpy")
+    from unittest.mock import MagicMock
+
+    # enable_semantic=False skips real model loading; embedder is set below.
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+
+    mock_embedder = MagicMock()
+    lesson_vec = np.ones(384) / np.sqrt(384)
+    mock_embedder.encode.return_value = lesson_vec
+    matcher.embedder = mock_embedder
+
+    lesson = Lesson(
+        path=Path("/tmp/lessons/cached.md"),
+        metadata=LessonMetadata(description="Use when caching matters"),
+        title="Cached Lesson",
+        description="",
+        category="tools",
+        body="## Rule\nCache it.",
+    )
+    query_embed = np.ones(384) / np.sqrt(384)
+    context = MatchContext(message="caching question")
+
+    first = matcher._semantic_score(query_embed, lesson, context)
+    second = matcher._semantic_score(query_embed, lesson, context)
+
+    # Same score both turns, but only encoded once (query embedding is supplied,
+    # so every encode call here is for the lesson text).
+    assert first == second
+    assert mock_embedder.encode.call_count == 1
+
+    # A different lesson text is a cache miss and triggers a fresh encode.
+    other = Lesson(
+        path=Path("/tmp/lessons/other.md"),
+        metadata=LessonMetadata(description="A different purpose entirely"),
+        title="Other Lesson",
+        description="",
+        category="tools",
+        body="## Rule\nDo other.",
+    )
+    matcher._semantic_score(query_embed, other, context)
+    assert mock_embedder.encode.call_count == 2
+
+
+@pytest.mark.timeout(30)
+def test_hybrid_matcher_does_not_eagerly_import_sentence_transformers():
+    """Importing hybrid_matcher must not trigger a sentence_transformers import.
+
+    sentence_transformers pulls in transformers + sklearn (~10s cumulative).
+    The module-level import was moved inside HybridLessonMatcher.__init__ so the
+    CLI doesn't pay that cost unless hybrid matching is actually used.
+    Regression guard for the perf/lazy-sentence-transformers fix.
+
+    Timeout override: the default 10s can be too tight on cold CI runners
+    that need to import the rig package tree in a fresh subprocess.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import rig.lessons.hybrid_matcher as hm;"
+                " blocked = {'sentence_transformers', 'transformers', 'sklearn'};"
+                " loaded = blocked & set(sys.modules);"
+                " print('LOADED:' + ','.join(sorted(loaded)) if loaded else 'OK');"
+                " sys.exit(1 if loaded else 0)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"Heavy deps eagerly imported from rig.lessons.hybrid_matcher: "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )

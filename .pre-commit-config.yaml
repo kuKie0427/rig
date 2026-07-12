@@ -1,0 +1,46 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+  - id: check-yaml
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.15.2
+  hooks:
+  - id: ruff
+    args: [ --fix ]
+  - id: ruff-format
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.12.0
+  hooks:
+  - id: mypy
+    additional_dependencies: [types-tabulate, types-docutils, tomli, tomli_w, opentelemetry-api, opentelemetry-sdk, prometheus-client, prompt_toolkit, click, pytest, openai==1.101.0, rich, tomlkit, dspy, textual]
+    args: [--ignore-missing-imports, --check-untyped-defs]
+- repo: local
+  hooks:
+  - id: check-rst-formatting
+    name: Check RST nested list formatting
+    description: Ensures RST files have proper blank lines between parent/child list items
+    entry: python3 scripts/check_rst_formatting.py
+    language: system
+    files: \.rst$
+    exclude: docs/_build/
+    args: [docs/]
+  - id: check-poetry-lock-sync
+    name: Check poetry.lock is in sync
+    description: Ensures poetry.lock is in sync with pyproject.toml
+    entry: bash scripts/check_poetry_lock_sync.sh
+    language: system
+    files: ^(pyproject\.toml|poetry\.lock)$
+    pass_filenames: false
+#- repo: local
+#  hooks:
+#  - id: pytest
+#    name: pytest
+#    stages: [commit]
+#    types: [python]
+#    entry: make test
+#    language: system
+#    pass_filenames: false
+#    always_run: true

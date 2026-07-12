@@ -1,0 +1,429 @@
+"""
+Gives the LLM agent the ability to patch text files, by using a adapted version git conflict markers.
+
+Environment Variables:
+    RIG_PATCH_RECOVERY: If set to "true" or "1", returns the file content in error messages
+                         when patches don't match. This helps the assistant recover faster
+                         by seeing the actual file contents.
+"""
+
+import difflib
+import re
+from collections.abc import Generator
+from dataclasses import dataclass
+from pathlib import Path
+
+from ..config import get_config
+from ..message import Message
+from ..util.ask_execute import execute_with_confirmation
+from .base import (
+    Parameter,
+    ToolSpec,
+    ToolUse,
+    get_path,
+)
+
+instructions = """
+To patch/modify files, we use an adapted version of git conflict markers.
+
+Multiple ORIGINAL/UPDATED blocks can make several changes in one patch.
+Keep patches small. Scope each change to a function/class. Avoid placeholders
+in ORIGINAL blocks; they must match the file exactly or the patch will fail.
+
+### When to use patch vs save
+
+Use `patch` for targeted edits to existing files.
+Use `save` for new files, full rewrites, or changes too large for patch markers.
+
+Note: When patching markdown, avoid replacing partial codeblocks (just the opening
+or closing backticks). The parser needs complete codeblocks. For simple
+codeblock-boundary changes (like a language tag), use `sed` or `perl` instead.
+""".strip()
+
+instructions_format = {
+    "markdown": f"""
+The $PATH parameter MUST be on the same line as the code block start, not on the line after.
+
+The patch block should be written in the following format:
+
+{
+        ToolUse(
+            "patch",
+            ["$PATH"],
+            '''
+<<<<<<< ORIGINAL
+$ORIGINAL_CONTENT
+=======
+$UPDATED_CONTENT
+>>>>>>> UPDATED
+'''.strip(),
+        ).to_output("markdown")
+    }
+""",
+    "tool": "The `patch` parameter must be a string containing conflict markers without any code block.",
+}
+
+ORIGINAL = "<<<<<<< ORIGINAL\n"
+DIVIDER = "\n=======\n"
+UPDATED = "\n>>>>>>> UPDATED"
+
+patch_content = """
+<<<<<<< ORIGINAL
+    print("Hello world")
+=======
+    name = input("What is your name? ")
+    print(f"Hello {name}")
+>>>>>>> UPDATED
+""".strip()
+
+
+def examples(tool_format):
+    return f"""
+> User: patch `src/hello.py` to ask for the name of the user
+```src/hello.py
+def hello():
+    print("Hello world")
+
+if __name__ == "__main__":
+    hello()
+```
+> Assistant:
+{ToolUse("patch", ["src/hello.py"], patch_content).to_output(tool_format)}
+> System: Patch applied
+""".strip()
+
+
+@dataclass
+class Patch:
+    original: str
+    updated: str
+
+    def apply(self, content: str) -> str:
+        # Fast path: try exact match first (backward compatible)
+        if self.original in content:
+            count = content.count(self.original)
+            if count > 1:
+                raise ValueError(
+                    f"original chunk is not unique ({count} matches found). "
+                    "Provide more surrounding context to make the match unique."
+                )
+            new_content = content.replace(self.original, self.updated, 1)
+            if new_content == content:
+                raise ValueError(
+                    "patch did not change the file "
+                    "(original and updated chunks are identical)"
+                )
+            return new_content
+
+        # Fallback: try relaxed matching (treat whitespace-only lines as equivalent)
+        actual_original = self._find_relaxed_match(content)
+        if actual_original is None:
+            # if original chunk not found, include file contents in error for fast recovery
+            file_contents = (
+                f"Here are the actual file contents:\n```original\n{content}\n```"
+                if get_config().get_env_bool("RIG_PATCH_RECOVERY")
+                else ""
+            )
+            raise ValueError(f"original chunk not found in file\n{file_contents}")
+
+        # Apply the replacement using the actual matched content
+        new_content = content.replace(actual_original, self.updated, 1)
+        if new_content == content:
+            raise ValueError(
+                "patch did not change the file "
+                "(original and updated chunks are identical)"
+            )
+        return new_content
+
+    def _find_relaxed_match(self, content: str) -> str | None:
+        """
+        Find a match for self.original in content using relaxed whitespace matching.
+        Returns the actual matched substring from content, or None if no match found.
+        Treats lines with only whitespace as equivalent regardless of whitespace content.
+        """
+        original_lines = self.original.splitlines(keepends=True)
+        content_lines = content.splitlines(keepends=True)
+
+        # Slide a window through content looking for matches
+        matches = []
+        for i in range(len(content_lines) - len(original_lines) + 1):
+            window = content_lines[i : i + len(original_lines)]
+            if self._lines_match_relaxed(window, original_lines):
+                # Found a match - extract the actual substring
+                actual_match = "".join(window)
+                matches.append((i, actual_match))
+
+        if len(matches) == 0:
+            return None
+        if len(matches) > 1:
+            raise ValueError(
+                f"original chunk is not unique ({len(matches)} matches with "
+                "relaxed whitespace matching). "
+                "Provide more surrounding context to make the match unique."
+            )
+
+        return matches[0][1]
+
+    def _lines_match_relaxed(
+        self, window_lines: list[str], original_lines: list[str]
+    ) -> bool:
+        """
+        Check if lines match using relaxed whitespace rules.
+        Lines containing only whitespace (spaces, tabs, etc.) are treated as equivalent.
+        """
+        if len(window_lines) != len(original_lines):
+            return False
+
+        for window_line, original_line in zip(window_lines, original_lines):
+            # If both lines are whitespace-only, they match
+            if window_line.strip() == "" and original_line.strip() == "":
+                continue
+            # Otherwise they must match exactly
+            if window_line != original_line:
+                return False
+
+        return True
+
+    def diff_minimal(self, strip_context=False) -> str:
+        """
+        Show a minimal diff of the patch.
+        Note that a minimal diff isn't necessarily a unique diff.
+        """
+        # TODO: replace previous patches with the minimal version
+
+        diff = list(
+            difflib.unified_diff(
+                self.original.splitlines(),
+                self.updated.splitlines(),
+                lineterm="",
+            )
+        )[3:]
+        if strip_context:
+            # find first and last lines with changes
+            markers = [line[0] for line in diff]
+            start = min(
+                markers.index("+") if "+" in markers else len(markers),
+                markers.index("-") if "-" in markers else len(markers),
+            )
+            end = min(
+                markers[::-1].index("+") if "+" in markers else len(markers),
+                markers[::-1].index("-") if "-" in markers else len(markers),
+            )
+            diff = diff[start : len(diff) - end]
+        return "\n".join(diff)
+
+    @classmethod
+    def _from_codeblock(cls, codeblock: str) -> Generator["Patch", None, None]:
+        codeblock = codeblock.strip()
+
+        # Split the codeblock into multiple patches
+        patches = re.split(f"(?={re.escape(ORIGINAL)})", codeblock)
+
+        for patch in patches:
+            if not patch.strip():
+                continue
+
+            if ORIGINAL not in patch:  # pragma: no cover
+                raise ValueError(f"invalid patch, no `{ORIGINAL.strip()}`", patch)
+
+            # First split on ORIGINAL to get the content after it
+            _, after_original = re.split(re.escape(ORIGINAL), patch, maxsplit=1)
+
+            # Then split on DIVIDER to get the original content
+            if DIVIDER not in after_original:  # pragma: no cover
+                raise ValueError("invalid patch format: missing =======")
+            original, after_divider = re.split(
+                re.escape(DIVIDER), after_original, maxsplit=1
+            )
+
+            # Finally split on UPDATED to get the modified content
+            # Use UPDATED[1:] to ignore the leading newline in the marker,
+            # allowing us to detect truly empty content between ======= and >>>>>>> UPDATED
+            if after_divider.startswith(UPDATED[1:]):
+                # Special case: empty content followed immediately by UPDATED marker
+                modified = ""
+            else:
+                if UPDATED not in after_divider:  # pragma: no cover
+                    raise ValueError("invalid patch format: missing >>>>>>> UPDATED")
+                modified, _ = re.split(re.escape(UPDATED), after_divider, maxsplit=1)
+
+                # Check for extra ======= markers in the updated content
+                # Use regex with negative lookahead to match exactly 7 equals signs
+                # This avoids matching longer sequences like RST heading underlines
+                # (e.g., ===================) while still catching actual extra dividers
+                if re.search(r"\n=======(?!=)", modified):
+                    raise ValueError(
+                        "invalid patch format: extra ======= marker found in updated content. "
+                        "Use only one ======= between original and updated content."
+                    )
+
+            yield Patch(original, modified)
+
+    @classmethod
+    def from_codeblock(cls, codeblock: str) -> Generator["Patch", None, None]:
+        for patch in cls._from_codeblock(codeblock):
+            original, updated = patch.original, patch.updated
+            re_placeholder = re.compile(r"^[ \t]*(#|//|\") \.\.\. ?.*$", re.MULTILINE)
+            if re_placeholder.search(original) or re_placeholder.search(updated):
+                originals = re_placeholder.split(original)
+                modifieds = re_placeholder.split(updated)
+                if len(originals) != len(modifieds):
+                    raise ValueError(
+                        "different number of placeholders in original and modified chunks"
+                    )
+                for orig, mod in zip(originals, modifieds):
+                    if orig == mod:
+                        continue
+                    yield Patch(orig, mod)
+            else:
+                yield patch
+
+
+def apply(codeblock: str, content: str) -> str:
+    """
+    Applies multiple patches in ``codeblock`` to ``content``.
+    Provides detailed error messages when patches fail.
+    """
+    patches = list(Patch.from_codeblock(codeblock))
+    total_hunks = len(patches)
+    new_content = content
+
+    for i, patch in enumerate(patches, 1):
+        try:
+            new_content = patch.apply(new_content)
+        except ValueError as e:
+            error_msg = str(e.args[0]) if e.args else str(e)
+            # Create a preview of the failing hunk (first few lines)
+            original_preview = patch.original[:100].replace("\n", "\\n")
+            if len(patch.original) > 100:
+                original_preview += "..."
+
+            if total_hunks == 1:
+                raise ValueError(error_msg) from None
+            status = f"Hunk {i}/{total_hunks} failed"
+            if i > 1:
+                status += f" ({i - 1} hunk(s) applied successfully before failure)"
+            raise ValueError(
+                f"{status}: {error_msg}\nFailed hunk starts with: {original_preview!r}"
+            ) from None
+
+    return new_content
+
+
+def preview_patch(content: str, path: Path | None) -> str | None:
+    """Prepare preview content for patch operation."""
+    try:
+        patches = Patch.from_codeblock(content)
+        return "\n@@@\n".join(p.diff_minimal() for p in patches)
+    except ValueError as e:
+        raise ValueError(f"Invalid patch: {e.args[0]}") from None
+
+
+def execute_patch_impl(
+    content: str, path: Path | None
+) -> Generator[Message, None, None]:
+    """Actual patch implementation."""
+    if path is None:
+        raise ValueError("Path is required to apply a patch")
+
+    # Print full path to give agent feedback about exactly which file is being patched
+    path_display = path
+    path = path.expanduser().resolve()
+
+    # Path traversal protection: validate relative paths stay within cwd
+    # Absolute paths are intentional and allowed, relative paths should not escape cwd
+    if not path_display.is_absolute():
+        cwd = Path.cwd().resolve()
+        try:
+            path.relative_to(cwd)
+        except ValueError as err:
+            raise ValueError(
+                f"Path traversal detected: {path_display} resolves to {path} "
+                f"which is outside current directory {cwd}"
+            ) from err
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            original_content = f.read()
+
+        # Apply the patch
+        patched_content = apply(content, original_content)
+
+        # Compare token counts and generate warnings
+        patch_len = len(content)
+        full_file_len = len(patched_content)
+        warnings = []
+        if patch_len > 1000 and patch_len > full_file_len:
+            warnings.append(
+                "Note: The patch was big and larger than the file. In the future, try writing smaller patches or use the save tool instead."
+            )
+
+        # Write the patched content
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(patched_content)
+
+        # Return success message with any warnings
+        warnings_str = "\n".join(warnings)
+        yield Message(
+            "system",
+            f"Patch successfully applied to `{path}`\n{warnings_str}".strip(),
+        )
+
+    except FileNotFoundError:
+        raise ValueError(
+            f"Patch failed: No such file or directory `{path}` (pwd: `{Path.cwd()}`)"
+        ) from None
+    except ValueError as e:
+        raise ValueError(f"Patch failed: {e.args[0]}") from None
+
+
+def execute_patch(
+    code: str | None,
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+) -> Generator[Message, None, None]:
+    """Applies the patch."""
+    if code is None and kwargs is not None:
+        code = kwargs.get("patch", code)
+
+    if not code:
+        yield Message("system", "Error: No patch provided by the assistant")
+        return
+
+    yield from execute_with_confirmation(
+        code,
+        args,
+        kwargs,
+        execute_fn=execute_patch_impl,
+        get_path_fn=get_path,
+        preview_fn=preview_patch,
+        preview_lang="diff",
+        confirm_msg=f"Apply patch to {get_path(code, args, kwargs)}?",
+        allow_edit=True,
+    )
+
+
+tool = ToolSpec(
+    name="patch",
+    desc="Apply a patch to a file",
+    instructions=instructions,
+    examples=examples,
+    execute=execute_patch,
+    block_types=["patch"],
+    parameters=[
+        Parameter(
+            name="path",
+            type="string",
+            description="The path of the file to patch.",
+            required=True,
+        ),
+        Parameter(
+            name="patch",
+            type="string",
+            description=f"The patch to apply. Use conflict markers! Example:\n{patch_content}",
+            required=True,
+        ),
+    ],
+    hints=frozenset({"file-ops", "destructive"}),
+)
+__doc__ = tool.get_doc(__doc__)

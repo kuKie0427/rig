@@ -1,0 +1,365 @@
+import atexit
+import logging
+import os
+from dataclasses import replace
+from typing import cast
+
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.logging import RichHandler
+
+from .cli.setup import ask_for_api_key
+from .commands import init_commands
+from .config import Config, get_config
+from .hooks import init_hooks
+from .llm import guess_provider_from_config, init_llm, is_custom_provider
+from .llm.llm_rig import RigAuthError
+from .llm.models import (
+    MODEL_ALIASES,
+    PROVIDERS,
+    CustomProvider,
+    ModelMeta,
+    Provider,
+    get_model,
+    get_recommended_model,
+    set_default_model,
+)
+from .message import is_output_json
+from .tools import ToolFormat, init_tools, set_tool_format
+from .util import console
+
+logger = logging.getLogger(__name__)
+_init_done = False
+
+
+def init(
+    model: str | None,
+    interactive: bool,
+    tool_allowlist: list[str] | None,
+    tool_format: ToolFormat,
+    no_confirm: bool = False,
+    server: bool = False,
+    require_llm: bool = True,
+):
+    """Initialize rig.
+
+    Args:
+        model: Model to use, or None for auto-detection
+        interactive: Whether running in interactive mode
+        tool_allowlist: List of tools to enable, or None for all
+        tool_format: Format for tool output
+        no_confirm: Whether to skip tool confirmations
+        server: Whether running in server mode (API/WebUI)
+        require_llm: If True (default), raise when LLM initialization fails.
+            If False, log a warning and continue without a default model —
+            callers (e.g. the server) can still accept per-request models.
+    """
+    global _init_done
+    if _init_done:
+        logger.warning("init() called twice, ignoring")
+        # Always update tool_format even on re-entry, as it may differ
+        # between conversations in the same process (e.g. test suite)
+        set_tool_format(tool_format)
+        return
+
+    load_dotenv()
+    _init_plugins()
+    try:
+        init_model(model, interactive)
+    except (ValueError, KeyError) as e:
+        if require_llm:
+            raise
+        # Server/degraded mode: keep starting up so the app is reachable
+        # and the user can configure a provider via env/config/UI.
+        first_line = str(e).split("\n", 1)[0]
+        logger.warning(
+            "Continuing without a default model (%s). "
+            "Clients must supply a model per-request, or set an API key and restart.",
+            first_line,
+        )
+    init_tools(tool_allowlist)
+    init_hooks(interactive=interactive, no_confirm=no_confirm, server=server)
+    init_commands()
+
+    set_tool_format(tool_format)
+    # Mark initialization done at the end so callers can retry init()
+    # after a failure earlier in this function.
+    _init_done = True
+
+
+def _init_plugins():
+    """Discover and initialize all plugins (folder-based + entry-point)."""
+    from .plugins import discover_all_plugins
+
+    config = get_config()
+    folder_paths, enabled = config.get_plugin_config()
+    discover_all_plugins(folder_paths=folder_paths or None, enabled_plugins=enabled)
+
+
+def init_model(
+    model: str | None = None,
+    interactive: bool = False,
+):
+    config = get_config()
+
+    # get from config
+    # Precedence: explicit CLI --model > per-chat saved model > [models].default > MODEL env var.
+    if not model:
+        model = (
+            (config.chat.model if config.chat else None)
+            or config.user.models.default
+            or config.get_env("MODEL")
+        )
+
+    if not model:  # pragma: no cover
+        # auto-detect depending on if OPENAI_API_KEY or ANTHROPIC_API_KEY is set
+        model = guess_provider_from_config()
+        if not model and not is_output_json():
+            console.print("[yellow]No API keys set, no provider available.[/yellow]")
+
+    # ask user for API key
+    if not model and interactive:
+        model, _ = ask_for_api_key()
+
+    # fail with actionable guidance
+    if not model:
+        raise ValueError(
+            "No API key found, couldn't auto-detect provider.\n\n"
+            "To get started, set an API key for one of these providers:\n"
+            "  export ANTHROPIC_API_KEY='sk-ant-...'\n"
+            "  export OPENAI_API_KEY='sk-...'\n"
+            "  export OPENROUTER_API_KEY='sk-or-...'\n\n"
+            "Or run interactively: rig\n"
+            "Or run the setup wizard: rig-onboard\n\n"
+            "Full guide: https://rig.org/docs/getting-started.html"
+        )
+
+    # Holds a pre-resolved ModelMeta when the resolution step already fetched it,
+    # so the final get_model(model_full) call below can be skipped.
+    _resolved_meta: ModelMeta | None = None
+
+    # Check if model has provider/model format
+    if "/" in model:
+        provider_part = model.split("/")[0]
+        # Check if it's a built-in provider or custom provider
+        if provider_part in PROVIDERS:
+            provider, model_name = cast(tuple[Provider, str], model.split("/", 1))
+        elif is_custom_provider(provider_part):
+            # Custom provider - use full model string, provider is extracted
+            provider = CustomProvider(provider_part)
+            model_name = "/".join(model.split("/")[1:])  # Rest after provider
+        else:
+            # Unrecognized provider prefix. Delegate to get_model(), which can
+            # still resolve provider-less model names (e.g. OpenRouter's
+            # "meta-llama/llama-3.1-405b-instruct") via dynamic lookup.
+            # Previously this mistook the whole "a/b" string for a provider name
+            # and crashed in get_recommended_model() with a misleading message.
+            resolved = get_model(model)
+            if resolved.provider == "unknown":
+                raise ValueError(
+                    f"Unknown model {model!r}. Use 'provider/model' with a known "
+                    f"provider (e.g. 'openrouter/{model}'), or configure a custom "
+                    f"provider. Run 'rig-util models list' to see available models."
+                )
+            provider = resolved.provider
+            model_name = resolved.model
+            _resolved_meta = resolved  # reuse below; avoids a redundant second lookup
+    else:
+        # No slash - check if it's a custom provider with default model
+        if is_custom_provider(model):
+            # Get the ModelMeta which will resolve the default model
+            model_meta = get_model(model)
+            provider = CustomProvider(model)
+            model_name = "/".join(
+                model_meta.model.split("/")[1:]
+            )  # Strip provider prefix
+        elif model in PROVIDERS:
+            # Bare builtin provider name (e.g. "anthropic"): use its
+            # recommended model below via get_recommended_model().
+            provider, model_name = cast(tuple[Provider, str], (model, None))
+        else:
+            # Not a provider at all - treat as a bare model name and resolve it
+            # via get_model() (e.g. "gpt-4o" -> openai/gpt-4o). Previously this
+            # blindly cast the model name to a provider, then crashed in
+            # get_recommended_model() with the misleading "Provider 'X' requires
+            # specifying a model" message. Mirrors the slash-path handling above.
+            resolved = get_model(model)
+            if resolved.provider == "unknown":
+                raise ValueError(
+                    f"Unknown model {model!r}. Use 'provider/model' with a known "
+                    f"provider (e.g. 'openai/{model}'), or configure a custom "
+                    f"provider. Run 'rig-util models list' to see available models."
+                )
+            provider = resolved.provider
+            model_name = resolved.model
+            _resolved_meta = resolved  # reuse below; avoids a redundant second lookup
+
+    # set up API_KEY and API_BASE, needs to be done before loading history to avoid saving API_KEY
+    if model_name is None:
+        model_name = get_recommended_model(provider)
+    model_full = f"{provider}/{model_name}"
+    if not is_output_json():
+        # Show the resolved alias if the model name is a known short alias
+        # (e.g. claude-haiku-4-5 → claude-haiku-4-5-20251001).
+        resolved_alias = MODEL_ALIASES.get(str(provider), {}).get(model_name)
+        if resolved_alias:
+            console.log(
+                f"Using model: [green]{model_full}[/green] (→ [dim]{resolved_alias}[/dim])"
+            )
+        else:
+            console.log(f"Using model: [green]{model_full}[/green]")
+    try:
+        init_llm(provider)
+    except RigAuthError:
+        if not _maybe_authenticate_rig_interactively(provider, interactive, config):
+            raise
+        init_llm(provider)
+
+    model_meta = _resolved_meta or get_model(model_full)
+
+    # Apply RIG_CONTEXT_LENGTH override (useful for local models with non-standard context)
+    context_length_str = os.environ.get("RIG_CONTEXT_LENGTH")
+    if context_length_str:
+        try:
+            context_length = int(context_length_str)
+        except ValueError:
+            logger.warning(
+                f"Invalid RIG_CONTEXT_LENGTH value: {context_length_str!r}, ignoring"
+            )
+        else:
+            model_meta = replace(model_meta, context=context_length)
+            logger.info(f"Context length overridden to {context_length} tokens")
+
+    set_default_model(model_meta)
+
+
+def _maybe_authenticate_rig_interactively(
+    provider: Provider,
+    interactive: bool,
+    config: Config,
+) -> bool:
+    """Offer inline rig.ai device-flow auth and return True if it completed."""
+    if provider != "rig" or not interactive or is_output_json():
+        return False
+
+    response = console.input(
+        "[yellow]No rig.ai login found.[/yellow] Start device-flow login now? [Y/n] "
+    ).strip()
+    if response and response.lower() not in {"y", "yes"}:
+        return False
+
+    from .llm.llm_rig import DEFAULT_SERVICE_URL, device_flow_authenticate
+
+    service_url = config.get_env("RIG_CLOUD_BASE_URL") or DEFAULT_SERVICE_URL
+    service_url = service_url.rstrip("/").removesuffix("/v1")
+    device_flow_authenticate(server_url=service_url)
+    return True
+
+
+class CompactRichHandler(RichHandler):
+    """RichHandler variant for user-facing CLIs.
+
+    Hides the level label for INFO and below (WARNING/ERROR still shown)
+    and dims informational messages, keeping only warnings+ prominent.
+    """
+
+    def render(self, *, record, traceback, message_renderable):
+        from rich.text import Text
+
+        # Per-record toggle is safe: logging serializes emit() per handler.
+        self._log_render.show_level = record.levelno >= logging.WARNING
+        if record.levelno < logging.WARNING and isinstance(message_renderable, Text):
+            message_renderable.style = "dim"
+        return super().render(
+            record=record, traceback=traceback, message_renderable=message_renderable
+        )
+
+
+# Whether the shared status console is currently in compact mode (dim "·"
+# marker + dimmed messages), so repeated init_logging() calls can toggle it.
+_console_compact = False
+
+
+def _set_console_compact(enabled: bool) -> None:
+    global _console_compact
+    if enabled == _console_compact:
+        return
+    _console_compact = enabled
+    if enabled:
+        from rich.theme import Theme
+
+        console._log_render.time_format = "·"
+        console._log_render.omit_repeated_times = False
+        console.push_theme(Theme({"log.message": "dim"}))
+    else:
+        console._log_render.time_format = "[%X]"
+        console._log_render.omit_repeated_times = True
+        console.pop_theme()
+
+
+def init_logging(verbose, *, stderr: bool = True, compact: bool = True):
+    """Set up Rich logging.
+
+    compact tunes output for user-facing CLIs: it hides the INFO level label
+    and the file:line trailer, dims informational messages, and replaces
+    timestamps with a dim "·" marker that distinguishes log/status lines from
+    conversation output (verbose mode disables it to keep full detail).
+    The server passes compact=False to keep conventional log output.
+    """
+    compact = compact and not verbose
+    handler_cls = CompactRichHandler if compact else RichHandler
+    if not stderr:
+        # Use the shared Rich Console (same instance rprint uses) so log
+        # output is serialized with streaming assistant output through a
+        # single Console, preventing stderr/stdout interleave mid-stream.
+        from rich import get_console as _get_console
+
+        log_console = _get_console()
+    else:
+        log_console = Console(stderr=True, log_path=False)
+    handler = handler_cls(
+        console=log_console,
+        show_path=not compact,
+        # in compact mode the "time" column is a constant marker, so repeat it
+        omit_repeated_times=not compact,
+    )
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(message)s",
+        # strftime format; "·" has no format codes so renders as a literal marker
+        datefmt="·" if compact else "[%X]",
+        handlers=[handler],
+        force=True,  # Override any previous logging configuration
+    )
+    # Give console.log() status lines (Using model/logdir/...) the same
+    # treatment as INFO log lines in compact mode: a dim "·" marker instead
+    # of a timestamp, and dimmed message text. Restored on non-compact calls.
+    _set_console_compact(compact)
+
+    # anthropic spams debug logs for every request
+    logging.getLogger("anthropic").setLevel(logging.INFO)
+    logging.getLogger("openai").setLevel(logging.INFO)
+    # set httpx logging to WARNING
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Apply debouncing filter for OpenTelemetry connection errors
+    # This shows the first error, then suppresses duplicates for 5 minutes
+    # Prevents spam while still alerting users to telemetry issues
+    # Uses singleton filter to share state with setup_telemetry() filters
+    try:
+        from .util._telemetry import get_connection_error_filter
+
+        otel_filter = get_connection_error_filter(cooldown_seconds=300.0)
+        logging.getLogger("opentelemetry").addFilter(otel_filter)
+    except ImportError:
+        # OpenTelemetry not installed, no need for filter
+        pass
+
+    # Register cleanup handler
+
+    def cleanup_logging():
+        logging.getLogger().removeHandler(handler)
+        logging.shutdown()
+
+    atexit.register(cleanup_logging)

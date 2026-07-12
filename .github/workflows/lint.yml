@@ -1,0 +1,74 @@
+name: Lint
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install poetry
+      run: pipx install poetry
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        cache: 'poetry'
+    - name: Install dependencies
+      run: |
+        make build
+        poetry install
+    - name: Check for lint
+      run: |
+        make lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install poetry
+      run: pipx install poetry
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        cache: 'poetry'
+    - name: Install dependencies
+      run: |
+        make build
+        poetry install -E server -E browser -E telemetry -E dspy -E tui
+        poetry run pip install tomli tomli_w
+    - name: Typecheck
+      run: |
+        make typecheck-coverage
+
+    - name: Upload type coverage to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v7
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: type-coverage
+        files: .mypy_coverage_report/cobertura.xml
+
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install poetry
+      run: pipx install poetry
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        cache: 'poetry'
+    - name: Install dependencies
+      run: |
+        make build
+        poetry install -E server
+    - name: Check OpenAPI specification
+      run: |
+        make check-openapi

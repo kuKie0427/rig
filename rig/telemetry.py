@@ -1,0 +1,542 @@
+"""
+Telemetry integration for rig performance monitoring.
+
+This module provides tracing and metrics collection to measure:
+- Parsing speeds
+- Server tokens/second
+- Tool execution times
+- LLM response times
+
+Heavy OpenTelemetry imports are lazy-loaded from _telemetry module.
+"""
+
+import functools
+import logging
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
+
+from .util._telemetry import (
+    clear_conversation_context,
+    enrich_span_with_context,
+    enrich_span_with_llm_metrics,
+    get_conversation_context,
+    get_telemetry_objects,
+    set_conversation_context,
+)
+from .util._telemetry import init_telemetry as _init
+from .util._telemetry import is_telemetry_enabled as _is_enabled
+from .util._telemetry import shutdown_telemetry as _shutdown
+
+# Re-export conversation context functions for use by other modules
+__all__ = [
+    "set_conversation_context",
+    "get_conversation_context",
+    "clear_conversation_context",
+    "is_telemetry_enabled",
+    "init_telemetry",
+    "shutdown_telemetry",
+    "trace_function",
+    "record_tokens",
+    "record_request_duration",
+    "record_tool_call",
+    "record_hook_call",
+    "record_conversation_change",
+    "record_llm_request",
+    "measure_tokens_per_second",
+]
+
+logger = logging.getLogger(__name__)
+
+# Type variable for generic function decoration
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def is_telemetry_enabled() -> bool:
+    """Check if telemetry is enabled."""
+    return _is_enabled()
+
+
+def init_telemetry(
+    service_name: str = "rig",
+    enable_flask_instrumentation: bool = True,
+    enable_requests_instrumentation: bool = True,
+    enable_openai_instrumentation: bool = True,
+    enable_anthropic_instrumentation: bool = True,
+    agent_name: str | None = None,
+    interactive: bool | None = None,
+) -> None:
+    """Initialize OpenTelemetry tracing and metrics.
+
+    Args:
+        service_name: Name of the service for telemetry
+        enable_flask_instrumentation: Whether to auto-instrument Flask
+        enable_requests_instrumentation: Whether to auto-instrument requests library
+        enable_openai_instrumentation: Whether to auto-instrument OpenAI
+        enable_anthropic_instrumentation: Whether to auto-instrument Anthropic
+        agent_name: Name of the agent (from rig.toml [agent].name)
+        interactive: Whether running in interactive mode (None = unknown, False = autonomous)
+    """
+    try:
+        _init(
+            service_name=service_name,
+            enable_flask_instrumentation=enable_flask_instrumentation,
+            enable_requests_instrumentation=enable_requests_instrumentation,
+            enable_openai_instrumentation=enable_openai_instrumentation,
+            enable_anthropic_instrumentation=enable_anthropic_instrumentation,
+            agent_name=agent_name,
+            interactive=interactive,
+        )
+    except ImportError:
+        logger.warning(
+            "Telemetry dependencies not available. Install with: pip install rig[telemetry]"
+        )
+
+
+def shutdown_telemetry() -> None:
+    """Shutdown telemetry providers."""
+    try:
+        _shutdown()
+    except ImportError:
+        pass
+
+
+def trace_function(
+    name: str | None = None, attributes: dict[str, Any] | None = None
+) -> Callable[[F], F]:
+    """Decorator to trace function execution."""
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not is_telemetry_enabled():
+                return func(*args, **kwargs)
+
+            telemetry_objects = get_telemetry_objects()
+            tracer = telemetry_objects["tracer"]
+
+            if tracer is None:
+                return func(*args, **kwargs)
+
+            span_name = name or f"{func.__module__}.{func.__name__}"
+
+            with tracer.start_as_current_span(span_name) as span:
+                # Add conversation context to all spans
+                enrich_span_with_context(span)
+
+                if attributes:
+                    for key, value in attributes.items():
+                        span.set_attribute(key, value)
+
+                # Add function info
+                span.set_attribute("function.name", func.__name__)
+                span.set_attribute("function.module", func.__module__)
+
+                try:
+                    result = func(*args, **kwargs)
+                    span.set_attribute("function.result.success", True)
+                    return result
+                except Exception as e:
+                    span.set_attribute("function.result.success", False)
+                    span.set_attribute("function.error.type", type(e).__name__)
+                    span.set_attribute("function.error.message", str(e))
+                    raise
+
+        return cast(F, wrapper)
+
+    return decorator
+
+
+def record_tokens(count: int, token_type: str = "total") -> None:
+    """Record token count metric."""
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    token_counter = telemetry_objects["token_counter"]
+
+    if token_counter is not None:
+        token_counter.add(count, {"token_type": token_type})
+
+
+def record_request_duration(
+    duration: float, endpoint: str, method: str = "GET"
+) -> None:
+    """Record request duration metric."""
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    request_histogram = telemetry_objects["request_histogram"]
+
+    if request_histogram is not None:
+        request_histogram.record(duration, {"endpoint": endpoint, "method": method})
+
+
+def record_tool_call(
+    tool_name: str,
+    duration: float | None = None,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    tool_format: str | None = None,
+) -> None:
+    """Record tool call metrics with span for Jaeger analysis."""
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    tool_counter = telemetry_objects["tool_counter"]
+    tool_duration_histogram = telemetry_objects["tool_duration_histogram"]
+    tracer = telemetry_objects["tracer"]
+
+    # Create a span for this tool call
+    if tracer is not None:
+        with tracer.start_as_current_span(f"tool.{tool_name}") as span:
+            enrich_span_with_context(span)
+            span.set_attribute("tool.name", tool_name)
+            span.set_attribute("tool.success", success)
+            if tool_format:
+                span.set_attribute("tool.format", tool_format)
+            if duration is not None:
+                span.set_attribute("tool.duration_seconds", duration)
+            if error_type:
+                span.set_attribute("tool.error.type", error_type)
+            if error_message:
+                span.set_attribute("tool.error.message", error_message[:200])
+
+            # Add span events
+            if success:
+                span.add_event("tool_completed", attributes={"tool": tool_name})
+            else:
+                span.add_event(
+                    "tool_failed",
+                    attributes={
+                        "tool": tool_name,
+                        "error_type": error_type or "unknown",
+                    },
+                )
+
+    if tool_counter is None:
+        return
+
+    attributes = {"tool_name": tool_name, "success": str(success).lower()}
+
+    if tool_format:
+        attributes["tool_format"] = tool_format
+    if error_type:
+        attributes["error_type"] = error_type
+    if error_message:
+        # Truncate long error messages
+        attributes["error_message"] = error_message[:200]
+
+    tool_counter.add(1, attributes)
+
+    if duration is not None and tool_duration_histogram is not None:
+        tool_duration_histogram.record(duration, attributes)
+
+
+def record_hook_call(
+    hook_name: str,
+    hook_type: str,
+    async_mode: bool,
+    duration: float,
+    success: bool = True,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    start_time_ns: int | None = None,
+) -> None:
+    """Record hook execution spans for Jaeger analysis."""
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    tracer = telemetry_objects["tracer"]
+
+    if tracer is None:
+        return
+
+    span_kwargs: dict[str, Any] = {}
+    if start_time_ns is not None:
+        span_kwargs["start_time"] = start_time_ns
+
+    span = tracer.start_span(f"hook.{hook_type}.{hook_name}", **span_kwargs)
+    try:
+        enrich_span_with_context(span)
+        span.set_attribute("hook.name", hook_name)
+        span.set_attribute("hook.type", hook_type)
+        span.set_attribute("hook.async_mode", async_mode)
+        span.set_attribute("hook.success", success)
+        span.set_attribute("hook.duration_seconds", duration)
+        if error_type:
+            span.set_attribute("hook.error.type", error_type)
+        if error_message:
+            span.set_attribute("hook.error.message", error_message[:200])
+
+        if success:
+            span.add_event(
+                "hook_completed",
+                attributes={"hook": hook_name, "hook_type": hook_type},
+            )
+        else:
+            span.add_event(
+                "hook_failed",
+                attributes={
+                    "hook": hook_name,
+                    "hook_type": hook_type,
+                    "error_type": error_type or "unknown",
+                },
+            )
+    finally:
+        if start_time_ns is None:
+            span.end()
+        else:
+            span.end(end_time=start_time_ns + int(duration * 1_000_000_000))
+
+
+def record_conversation_change(delta: int) -> None:
+    """Record change in active conversations (+1 for new, -1 for ended)."""
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    active_conversations_gauge = telemetry_objects["active_conversations_gauge"]
+
+    if active_conversations_gauge is not None:
+        active_conversations_gauge.add(delta)
+
+
+def _calculate_llm_cost(
+    provider: str,
+    model: str,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+) -> float:
+    """Calculate the cost of an LLM request."""
+    from .llm.models import get_model  # lazy — breaks telemetry → llm circular dep
+
+    lookup_model = model if "/" in model else f"{provider}/{model}"
+    meta = get_model(lookup_model)
+    if not (meta and input_tokens and output_tokens):
+        return 0.0
+
+    price_in = (meta.price_input or 0.0) / 1e6
+    price_out = (meta.price_output or 0.0) / 1e6
+    cost = input_tokens * price_in + output_tokens * price_out
+
+    # Cache pricing per provider
+    caching_cost = 0.0
+    if provider == "anthropic":
+        # anthropic charges 1.25x for cache writes + 0.1x for cache reads
+        # cache reads use input pricing (cached input tokens being read)
+        price_cache_read = 0.1 * price_in
+        price_cache_write = 1.25 * price_in
+        cost_cache_read = price_cache_read * (cache_read_tokens or 0)
+        cost_cache_write = price_cache_write * (cache_creation_tokens or 0)
+        caching_cost = cost_cache_read + cost_cache_write
+    elif provider == "openai":
+        # openai charges 0.5x for cache reads (based on input pricing)
+        price_cache_read = 0.5 * price_in
+        caching_cost = price_cache_read * (cache_read_tokens or 0)
+
+    return cost + caching_cost
+
+
+def record_llm_request(
+    provider: str,
+    model: str,
+    success: bool = True,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    total_tokens: int | None = None,
+) -> None:
+    """Record LLM API request metrics with optional token usage.
+
+    Creates a span with cost and cache metrics for Jaeger analysis,
+    and records metrics for Prometheus/Grafana dashboards.
+    """
+    logger.debug(
+        f"Recording LLM request: provider={provider}, model={model}, success={success}"
+    )
+    total_in = (
+        (input_tokens or 0) + (cache_read_tokens or 0) + (cache_creation_tokens or 0)
+    )
+    total_out = output_tokens or 0
+    logger.debug(
+        f"tokens in:  {input_tokens}"
+        + (
+            f" + {cache_creation_tokens} cache create ({100 * (cache_creation_tokens or 0) / (total_in):.1f}%)"
+            if cache_creation_tokens
+            else ""
+        )
+        + (
+            f" + {cache_read_tokens} cache read ({100 * (cache_read_tokens or 0) / (total_in):.1f}%)"
+            if cache_read_tokens
+            else ""
+        )
+    )
+    logger.debug(f"tokens out: {output_tokens}")
+
+    if total_tokens:
+        diff_pct = abs(total_tokens - (total_in + total_out)) / total_tokens
+        if diff_pct > 0.01:  # Suppress if <1% discrepancy (normal for providers)
+            logger.warning(
+                f"Total tokens {total_tokens} ({diff_pct:.1%} diff) does not match sum of parts {total_in + total_out}, this is an implementation issue."
+            )
+
+    cost = _calculate_llm_cost(
+        provider=provider,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+    )
+    logger.debug(f"LLM request cost: ${cost:.6f}")
+
+    # Record to CostTracker for session-level aggregation
+    from time import time
+
+    from .util.cost_tracker import CostEntry, CostTracker
+
+    CostTracker.record(
+        CostEntry(
+            timestamp=time(),
+            model=model,
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
+            cache_read_tokens=cache_read_tokens or 0,
+            cache_creation_tokens=cache_creation_tokens or 0,
+            cost=cost,
+        )
+    )
+
+    # Detect poor cost effectiveness patterns
+    if cache_creation_tokens and cache_read_tokens:
+        hit_rate = cache_read_tokens / total_in
+        if hit_rate < 0.5 and total_in > 20000:
+            logger.warning(
+                f"Costly usage patterns detected: large request with low cache hit rate: {hit_rate:.1%} (uncached: {input_tokens}t, create: {cache_creation_tokens}t, read: {cache_read_tokens}t)"
+            )
+
+    if not is_telemetry_enabled():
+        return
+
+    telemetry_objects = get_telemetry_objects()
+    llm_request_counter = telemetry_objects["llm_request_counter"]
+    tracer = telemetry_objects["tracer"]
+
+    # Create a span for this LLM request for Jaeger analysis
+    if tracer is not None:
+        with tracer.start_as_current_span("llm_request") as span:
+            # Add conversation context
+            enrich_span_with_context(span)
+
+            # Add basic attributes
+            span.set_attribute("llm.provider", provider)
+            span.set_attribute("llm.model", model)
+            span.set_attribute("llm.success", success)
+
+            # Add rich metrics for Jaeger analysis
+            enrich_span_with_llm_metrics(
+                span,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cost=cost,
+            )
+
+            # Add span event for request completion
+            span.add_event(
+                "llm_request_complete",
+                attributes={
+                    "provider": provider,
+                    "model": model,
+                    "success": str(success),
+                    "cost_usd": f"{cost:.6f}" if cost else "0",
+                },
+            )
+
+    if llm_request_counter is None:
+        return
+
+    attributes = {
+        "provider": provider,
+        "model": model,
+        "success": str(success).lower(),
+    }
+
+    # Add token counts as attributes if provided
+    if input_tokens is not None:
+        attributes["input_tokens"] = str(input_tokens)
+    if output_tokens is not None:
+        attributes["output_tokens"] = str(output_tokens)
+    if cache_creation_tokens is not None:
+        attributes["cache_creation_tokens"] = str(cache_creation_tokens)
+    if cache_read_tokens is not None:
+        attributes["cache_read_tokens"] = str(cache_read_tokens)
+    if total_tokens is not None:
+        attributes["total_tokens"] = str(total_tokens)
+    if cost > 0:
+        attributes["cost"] = f"{cost:.6f}"
+
+    llm_request_counter.add(1, attributes)
+
+    # Also record individual token metrics for existing dashboards/queries
+    if input_tokens:
+        record_tokens(input_tokens, "input")
+    if output_tokens:
+        record_tokens(output_tokens, "output")
+    if cache_creation_tokens:
+        record_tokens(cache_creation_tokens, "cache_creation")
+    if cache_read_tokens:
+        record_tokens(cache_read_tokens, "cache_read")
+    if total_tokens:
+        record_tokens(total_tokens, "total")
+
+
+def measure_tokens_per_second(func: F) -> F:
+    """Decorator to measure tokens per second for LLM operations."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_telemetry_enabled():
+            return func(*args, **kwargs)
+
+        telemetry_objects = get_telemetry_objects()
+        tracer = telemetry_objects["tracer"]
+
+        if tracer is None:
+            return func(*args, **kwargs)
+
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+
+        # Try to extract token count from result
+        # This is a heuristic and may need adjustment based on actual return types
+        token_count = 0
+        if hasattr(result, "usage") and hasattr(result.usage, "total_tokens"):
+            token_count = result.usage.total_tokens
+        elif isinstance(result, dict) and "usage" in result:
+            token_count = result["usage"].get("total_tokens", 0)
+
+        if token_count > 0:
+            duration = end_time - start_time
+            tokens_per_second = token_count / duration if duration > 0 else 0
+
+            with tracer.start_as_current_span("llm_tokens_per_second") as span:
+                span.set_attribute("tokens.count", token_count)
+                span.set_attribute("tokens.duration_seconds", duration)
+                span.set_attribute("tokens.per_second", tokens_per_second)
+
+            record_tokens(token_count, "llm_response")
+
+        return result
+
+    return cast(F, wrapper)

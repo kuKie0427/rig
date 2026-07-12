@@ -1,0 +1,348 @@
+"""
+LLM-related commands: model, tools, context, tokens.
+"""
+
+from collections import defaultdict
+
+from .base import CommandContext, command
+
+
+def _complete_model(partial: str, _prev_args: list[str]) -> list[tuple[str, str]]:
+    """Complete model names using dynamic fetching with caching.
+
+    Uses the same model listing logic as rig-util models list --simple.
+    Caching is handled by get_model_list() in models.py.
+    """
+    from ..llm.models import (  # fmt: skip
+        MODELS,
+        PROVIDERS,
+        get_default_model,
+        get_model_list,
+    )
+
+    completions: list[tuple[str, str]] = []
+    current = get_default_model()
+
+    # Check if user is typing a provider prefix
+    if "/" not in partial:
+        # Show provider/ prefixes that match
+        for provider in PROVIDERS:
+            provider_prefix = f"{provider}/"
+            if provider_prefix.startswith(partial) or provider.startswith(partial):
+                # Count models for this provider
+                model_count = len(MODELS.get(provider, {}))
+                desc = f"{model_count} models" if model_count else "dynamic"
+                completions.append((provider_prefix, desc))
+
+    # Get full model list (cached in get_model_list), excluding deprecated
+    try:
+        models = get_model_list(dynamic_fetch=True, include_deprecated=False)
+        for model_meta in models:
+            full_name = model_meta.full
+            if full_name.startswith(partial):
+                is_current = current and current.full == full_name
+                desc = "(current)" if is_current else ""
+                completions.append((full_name, desc))
+    except (ImportError, ValueError, AttributeError, OSError):
+        # Fall back to empty list on error (provider prefixes will still show)
+        pass
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_completions = []
+    for item in completions:
+        if item[0] not in seen:
+            seen.add(item[0])
+            unique_completions.append(item)
+
+    return unique_completions[:30]  # Limit to 30 completions
+
+
+@command("model", completer=_complete_model)
+def cmd_model(ctx: CommandContext) -> None:
+    """Show or switch the current model."""
+    from ..config import ChatConfig  # fmt: skip
+    from ..llm.models import (  # fmt: skip
+        get_default_model,
+        set_default_model,
+    )
+
+    if ctx.args:
+        new_model = ctx.args[0]
+        set_default_model(new_model)
+        # Persist the model change to config so it survives restart/resume
+        chat_config = ChatConfig.from_logdir(ctx.manager.logdir)
+        chat_config.model = new_model
+        chat_config.save()
+        print(f"Set model to {new_model}")
+    else:
+        model = get_default_model()
+        if not model:
+            print("No model configured. Use `/model <model>` to set one.")
+            return
+        print(f"Current model: {model.full}")
+        print(
+            f"  price: input ${model.price_input}/Mtok, output ${model.price_output}/Mtok"
+        )
+        print(f"  context: {model.context}, max output: {model.max_output}")
+        print(
+            f"  (streaming: {model.supports_streaming}, vision: {model.supports_vision})"
+        )
+
+
+@command("models")
+def cmd_models(ctx: CommandContext) -> None:
+    """List available models."""
+    ctx.manager.undo(1, quiet=True)
+    _print_available_models()
+
+
+def _complete_tools(partial: str, _prev_args: list[str]) -> list[tuple[str, str]]:
+    """Complete tool names for /tools command."""
+    from ..tools import get_available_tools  # fmt: skip
+
+    subcommands = [
+        ("load", "Load a tool mid-conversation"),
+    ]
+    # If first arg, suggest subcommands and tool names
+    if not _prev_args:
+        completions = subcommands[:]
+        for tool in get_available_tools():
+            completions.append((tool.name, tool.desc[:60]))
+        return [(name, desc) for name, desc in completions if name.startswith(partial)]
+    # If after "load", suggest unloaded tools (only available ones with satisfied deps)
+    if _prev_args and _prev_args[0] == "load":
+        from ..tools import get_tools  # fmt: skip
+
+        loaded_names = {t.name for t in get_tools()}
+        return [
+            (t.name, t.desc[:60])
+            for t in get_available_tools()
+            if t.name not in loaded_names
+            and t.is_available
+            and t.name.startswith(partial)
+        ]
+    return []
+
+
+@command("tools", completer=_complete_tools)
+def cmd_tools(ctx: CommandContext):
+    """Show available tools or load new ones mid-conversation.
+
+    Usage:
+        /tools              List loaded tools (with hint about others)
+        /tools <name>       Show detailed info for a specific tool
+        /tools --all        Show all available tools including unloaded
+        /tools load <name>  Load a tool into the current conversation
+    """
+    from ..message import Message  # fmt: skip
+    from ..tools import get_available_tools, get_tool, get_tools, load_tool  # fmt: skip
+    from ..tools.base import get_tool_format  # fmt: skip
+    from ..util.tool_format import format_tool_info, format_tools_list  # fmt: skip
+
+    show_all = ctx.args and ctx.args[0] == "--all"
+    args = [a for a in ctx.args if a != "--all"] if ctx.args else []
+
+    # Handle /tools load <name>
+    if args and args[0] == "load":
+        if len(args) < 2:
+            print("Usage: /tools load <name>")
+            print("Available unloaded tools:")
+            loaded_names = {t.name for t in get_tools()}
+            for t in sorted(get_available_tools(), key=lambda t: t.name):
+                if t.name not in loaded_names:
+                    print(f"  {t.name}: {t.desc}")
+            return
+
+        tool_name = args[1]
+        try:
+            new_tool = load_tool(tool_name)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+
+        print(f"Tool '{new_tool.name}' loaded successfully.")
+
+        # Build a system message with the tool's instructions
+        tool_format = get_tool_format()
+        prompt = new_tool.get_tool_prompt(examples=True, tool_format=tool_format)
+        yield Message(
+            "system",
+            f"The following tool has been loaded and is now available:\n{prompt}\n",
+        )
+        return
+
+    if args:
+        # Show info for specific tool
+        tool_name = args[0]
+        # Look in both loaded and available tools
+        tool = get_tool(tool_name)
+        if not tool:
+            # Check if it's an available but not loaded tool
+            available_dict = {t.name: t for t in get_available_tools()}
+            if tool_name in available_dict:
+                tool = available_dict[tool_name]
+            else:
+                print(f"Tool '{tool_name}' not found.")
+                print("Loaded tools:", ", ".join(t.name for t in get_tools()))
+                print("Available tools:", ", ".join(available_dict.keys()))
+                return
+        print(format_tool_info(tool))
+    else:
+        # List tools
+        loaded = get_tools()
+        available = get_available_tools()
+
+        if show_all:
+            print(format_tools_list(available, show_all=True))
+        else:
+            print(format_tools_list(loaded, show_all=False))
+
+            # Show hint about other available tools
+            loaded_names = {t.name for t in loaded}
+            unloaded = [t for t in available if t.name not in loaded_names]
+            if unloaded:
+                unloaded_names = ", ".join(sorted(t.name for t in unloaded))
+                print(
+                    f"\nOther available tools (use '/tools load <name>' to add): {unloaded_names}"
+                )
+
+
+@command("context")
+def cmd_context(ctx: CommandContext) -> None:
+    """Show context token usage breakdown."""
+    from ..llm.models import get_default_model  # fmt: skip
+    from ..tools import ToolUse  # fmt: skip
+    from ..util import console  # fmt: skip
+    from ..util.context_savings import summarize_context_savings  # fmt: skip
+    from ..util.tokens import len_tokens  # fmt: skip
+
+    # Try to use the current model's tokenizer, fallback to gpt-4
+    current_model = get_default_model()
+    tokenizer_model = "gpt-4"
+    is_approximate = True
+
+    if current_model:
+        # Use matching tokenizer for OpenAI models
+        if current_model.provider == "openai" or (
+            current_model.provider == "openrouter"
+            and current_model.model.startswith("openai/")
+        ):
+            tokenizer_model = current_model.model.split("/")[-1]
+            is_approximate = False
+
+    # Track token counts by category
+    by_role: dict[str, int] = defaultdict(int)
+    by_type: dict[str, int] = defaultdict(int)
+
+    # Analyze each message (including hidden, since they're sent to the model)
+    for msg in ctx.manager.log.messages:
+        content_tokens = len_tokens(msg.content, tokenizer_model)
+
+        # Count by role
+        by_role[msg.role] += content_tokens
+
+        # Categorize content type
+        # Check for tool uses
+        tool_uses = list(ToolUse.iter_from_content(msg.content))
+        if tool_uses:
+            by_type["tool_use"] += content_tokens
+        # Check for thinking blocks (Anthropic uses <thinking> tags)
+        elif "<thinking>" in msg.content or "<think>" in msg.content:
+            by_type["thinking"] += content_tokens
+        else:
+            by_type["message"] += content_tokens
+
+    # Calculate totals
+    total_tokens = sum(by_role.values())
+
+    # Display breakdown
+    console.log("[bold]Token Usage by Role:[/bold]")
+    for role in ["system", "user", "assistant"]:
+        tokens = by_role.get(role, 0)
+        pct = (tokens / total_tokens * 100) if total_tokens > 0 else 0
+        console.log(f"  {role:10s}: {tokens:6,} ({pct:5.1f}%)")
+
+    console.log("\n[bold]Token Usage by Type:[/bold]")
+    for type_name, tokens in sorted(by_type.items(), key=lambda x: x[1], reverse=True):
+        pct = (tokens / total_tokens * 100) if total_tokens > 0 else 0
+        console.log(f"  {type_name:10s}: {tokens:6,} ({pct:5.1f}%)")
+
+    console.log(f"\n[bold]Total Context:[/bold] {total_tokens:,} tokens")
+
+    savings = summarize_context_savings(ctx.manager.logdir)
+    if savings.entries:
+        console.log("\n[bold]Context Savings:[/bold]")
+        console.log(
+            "  "
+            f"{savings.total_saved_tokens:,} tokens saved across "
+            f"{savings.entries} truncated tool output(s)"
+        )
+        for source, saved_tokens in sorted(
+            savings.saved_tokens_by_source.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            calls = savings.calls_by_source[source]
+            console.log(
+                f"  {source:10s}: {saved_tokens:6,} tokens across {calls} call(s)"
+            )
+        console.log(
+            f"[dim]  largest single save: {savings.max_saved_tokens:,} tokens[/dim]"
+        )
+
+    # Show context window utilization if model info is available
+    if current_model and current_model.context > 0:
+        context_limit = current_model.context
+        remaining = max(0, context_limit - total_tokens)
+        utilization = (total_tokens / context_limit * 100) if context_limit > 0 else 0
+
+        # Color-code utilization: green < 50%, yellow 50-80%, red > 80%
+        if utilization > 80:
+            color = "red"
+        elif utilization > 50:
+            color = "yellow"
+        else:
+            color = "green"
+
+        console.log(
+            f"[bold]Context Window:[/bold] [{color}]{utilization:.0f}%[/{color}] "
+            f"used ({total_tokens:,} / {context_limit:,}), "
+            f"{remaining:,} remaining"
+        )
+        if current_model.max_output:
+            effective_remaining = max(0, remaining - current_model.max_output)
+            console.log(
+                f"[dim]  max output: {current_model.max_output:,} tokens, "
+                f"effective input capacity: {effective_remaining:,}[/dim]"
+            )
+
+    if is_approximate:
+        console.log(f"[dim](approximate, using {tokenizer_model} tokenizer)[/dim]")
+
+
+@command("tokens", aliases=["cost"])
+def cmd_tokens(ctx: CommandContext) -> None:
+    """Show token usage and costs.
+
+    Shows session costs (current session) and conversation costs (all messages)
+    when both are available. Falls back to approximation for old conversations.
+    """
+    from ..util.cost_display import (
+        display_costs,
+        gather_conversation_costs,
+        gather_per_step_costs,
+        gather_session_costs,
+    )
+
+    session = gather_session_costs()
+    conversation = gather_conversation_costs(ctx.manager.log.messages)
+    per_step = gather_per_step_costs(ctx.manager.log.messages)
+    display_costs(session, conversation, per_step=per_step)
+
+
+def _print_available_models() -> None:
+    """Print all available models from all providers."""
+    from ..llm.models import list_models  # fmt: skip
+
+    list_models(dynamic_fetch=True)

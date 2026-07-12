@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'rig'
+    static_configs:
+      - targets: ['172.17.0.1:8000']  # Linux-compatible alternative to host.docker.internal
+    metrics_path: '/metrics'
+    scrape_interval: 5s
