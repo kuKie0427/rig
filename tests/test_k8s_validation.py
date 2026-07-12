@@ -672,6 +672,11 @@ class TestD2Analogues:
         assert d.deny_dimension == "D2"
         assert d.risk_level == "medium"
 
+    def test_cilium_policy_import_with_global_flag_is_d2(self):
+        d = classify_k8s_command("cilium --context prod policy import")
+        assert d.deny_dimension == "D2"
+        assert d.risk_level == "medium"
+
     def test_istioctl_install_is_d2(self):
         d = classify_k8s_command("istioctl install")
         assert d.deny_dimension == "D2"
@@ -717,7 +722,7 @@ class TestFlagToleranceComprehensive:
         d = classify_k8s_command("helm -n kube-system uninstall r1")
         assert d.deny_dimension == "D2"
 
-    def test_argocd_global_flag_before_app_subcommand(self):
+    def test_argocd_global_flag_before_app_subcommand_limitation(self):
         d = classify_k8s_command("argocd --grpc-web app get my-app --kubecontext prod")
         assert d.action == "hitl"
         assert d.family == "argocd"
@@ -846,7 +851,7 @@ class TestEdgeCasesExpanded:
         assert d.deny_dimension == "D5"
         assert d.risk_level == "medium"
 
-    def test_multiline_command_with_global_flags(self):
+    def test_multiline_command_with_global_flags_limitation(self):
         cmd = "kubectl --context prod \\\n  delete ns foo"
         d = classify_k8s_command(cmd)
         assert d.action == "hitl"

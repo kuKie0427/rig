@@ -165,7 +165,7 @@ DENY_GROUPS: list[tuple[str, list[str], str]] = [
         "D2",
         [
             r"\bhelm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:uninstall|delete)\b",
-            r"\bcilium\s+policy\s+import\b",
+            r"\bcilium\b(?:\s+--?\S+(?:\s+\S+)?)*\s+policy\s+import\b",
             r"(?<![\w-])istioctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+install(?![\w-])",
         ],
         "[D2] helm uninstall / cilium policy import / istioctl install: required 2/3 approver",
