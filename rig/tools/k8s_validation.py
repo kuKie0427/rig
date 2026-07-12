@@ -116,65 +116,65 @@ ALLOWLISTED_SUBCOMMANDS: dict[str, list[str | tuple[str, ...]]] = {
 # only with care: see module docstring "Known limitations".
 #
 # Risk level per dimension is encoded in `RISK_LEVEL_BY_DIMENSION` below.
-# `--force` escalations for D1 / D5 are handled by `_has_force_escalation`.
+# `--force` and ClusterRole-pattern escalations for D1 / D5 are handled
+# by `_should_escalate_to_high`.
 DENY_GROUPS: list[tuple[str, list[str], str]] = [
     (
         "D7",
         [
-            r"\bkubectl\s+exec\b",
-            r"\bkubectl\s+cp\b",
-            r"\bkubectl\s+port-forward\b",
-            r"\bkubectl\s+proxy\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:exec|cp|port-forward|proxy)\b",
         ],
         "[D7] lateral-movement access (exec/cp/port-forward/proxy): required 3/3 approver",
     ),
     (
         "D6",
         [
-            r"\bkubectl\s+delete\s+(?:--?\S+\s+)*\b(?:namespace|ns)\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:namespace|ns)\b",
         ],
         "[D6] namespace deletion: required 3/3 approver + 30s lock",
     ),
     (
         "D5",
         [
-            r"\bkubectl\s+auth\s+reconcile\b",
-            r"\bkubectl\s+apply\s+(?:-f\s+|--filename\s*=)?\S*cluster\S*role\S*\.ya?ml\b",
-            r"\bargocd\s+app\s+sync\b",
-            r"\bflux\s+reconcile\b",
-            r"\bkubectl\s+krew\s+install\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+auth\s+reconcile\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+apply\b",
+            r"(?<![\w-])argocd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app\b(?:\s+--?\S+(?:\s+\S+)?)*\s+sync(?![\w-])",
+            r"(?<![\w-])flux\b(?:\s+--?\S+(?:\s+\S+)?)*\s+reconcile(?![\w-])",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+krew\b(?:\s+--?\S+(?:\s+\S+)?)*\s+install\b",
         ],
-        "[D5] privileged RBAC / GitOps sync / krew install: required 2/3 approver (3/3 if --force)",
+        "[D5] privileged RBAC / GitOps sync / krew install / kubectl apply: required 2/3 approver (3/3 if --force or ClusterRole modify)",
     ),
     (
         "D4",
         [
-            r"\bkubectl\s+drain\b",
-            r"\bkubectl\s+cordon\b",
-            r"\bkubectl\s+taint\s+nodes?\b[^|;&]*NoSchedule-",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+drain\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cordon\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+taint\s+nodes?\b[^\n;&|]*NoSchedule-",
         ],
         "[D4] node drain / cordon / taint eviction: required 2/3 approver",
     ),
     (
         "D3",
         [
-            r"\bkubectl\s+scale\b[^|;&]*--replicas(?:\s*=|\s+)0\b",
-            r"\bkubectl\s+rollout\s+undo\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+scale\b[^\n;&|]*--replicas(?:\s*=|\s+)0\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+rollout\b(?:\s+--?\S+(?:\s+\S+)?)*\s+undo\b",
         ],
         "[D3] scale-to-zero / rollout undo: required 2/3 approver",
     ),
     (
         "D2",
         [
-            r"\bhelm\s+(?:uninstall|delete)\b",
+            r"\bhelm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:uninstall|delete)\b",
+            r"\bcilium\s+policy\s+import\b",
+            r"(?<![\w-])istioctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+install(?![\w-])",
         ],
-        "[D2] helm uninstall / delete: required 2/3 approver",
+        "[D2] helm uninstall / cilium policy import / istioctl install: required 2/3 approver",
     ),
     (
         "D8",
         [
-            r"\bkubectl\s+edit\b",
-            r"\bkubectl\s+debug\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+edit\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+debug\b",
         ],
         "[D8] schemaless edit / ephemeral debug: required 2/3 approver",
     ),
@@ -184,7 +184,7 @@ DENY_GROUPS: list[tuple[str, list[str], str]] = [
         # (e.g. `kubectl delete ns foo` matches D6 first, not D1).
         "D1",
         [
-            r"\bkubectl\s+delete\b",
+            r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\b",
         ],
         "[D1] kubectl delete op: required 2/3 approver (3/3 if --force --grace-period=0)",
     ),
@@ -202,6 +202,10 @@ RISK_LEVEL_BY_DIMENSION: dict[str, RiskLevel] = {
     "D7": "high",
     "D8": "medium",
 }
+
+
+# ClusterRole modification is `high` per DIRECTIONS.md § Phase 1 § HITL.
+_CLUSTERROLE_ESCALATION_PATTERN = re.compile(r"cluster\S*role", re.IGNORECASE)
 
 
 # Read by callers to compose the `N-of-M` approval gate. Phase 1
@@ -287,7 +291,7 @@ def classify_k8s_command(command: str) -> K8sCommandDecision:
     deny_dimension, matched_text = _match_deny_group(command)
     if deny_dimension is not None:
         risk_level: RiskLevel = RISK_LEVEL_BY_DIMENSION[deny_dimension]
-        if _has_force_escalation(command, deny_dimension):
+        if _should_escalate_to_high(command, deny_dimension):
             risk_level = "high"
         sub = _extract_subcommand(rest)
         return K8sCommandDecision(
@@ -459,20 +463,35 @@ def _match_deny_group(command: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _has_force_escalation(command: str, dimension: str) -> bool:
-    """Return True if a `--force` flag elevates risk to `high` for `dimension`.
-
-    Only D1 (kubectl delete) and D5 (gitops / clusterrole sync) escalate.
-    D7 is already high unconditionally; D6 is high unconditionally. D2/D3/D4/D8
-    do not have a force-escalation path under Phase 1.
-    """
-    if dimension not in ("D1", "D5"):
-        return False
-
+def _has_force_flag(command: str) -> bool:
+    """Return True if `--force` is present in `command` outside quotes / heredocs."""
     safe_regions = _find_quotes(command) + _find_heredoc_regions(command)
     for match in _FORCE_FLAG_PATTERN.finditer(command):
         if not _is_in_quoted_region(match.start(), safe_regions):
             return True
+    return False
+
+
+def _should_escalate_to_high(command: str, dimension: str) -> bool:
+    """True if D1 / D5 should escalate from base risk to high for this command.
+
+    Escalation rules (DIRECTIONS.md § Phase 1 § HITL):
+    D1: --force. D5: --force OR ClusterRole pattern (matching outside
+        quotes / heredocs — `kubectl apply 'clusterrole.yaml'` is NOT
+        a real ClusterRole modify).
+    D7 / D6 are already high unconditionally; D2 / D3 / D4 / D8 do not
+    escalate under Phase 1.
+    """
+    if dimension == "D1":
+        return _has_force_flag(command)
+    if dimension == "D5":
+        if _has_force_flag(command):
+            return True
+        safe_regions = _find_quotes(command) + _find_heredoc_regions(command)
+        for match in _CLUSTERROLE_ESCALATION_PATTERN.finditer(command):
+            if not _is_in_quoted_region(match.start(), safe_regions):
+                return True
+        return False
     return False
 
 

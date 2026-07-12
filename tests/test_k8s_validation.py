@@ -266,12 +266,22 @@ class TestDenyD5:
     def test_kubectl_apply_clusterrole(self):
         d = classify_k8s_command("kubectl apply -f clusterrole.yaml")
         assert d.deny_dimension == "D5"
-        assert d.risk_level == "medium"
+        assert d.risk_level == "high"
 
     def test_kubectl_apply_clusterrole_no_dash_f(self):
         d = classify_k8s_command("kubectl apply clusterrole.yaml")
         assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_kubectl_apply_no_clusterrole_no_force_is_medium(self):
+        d = classify_k8s_command("kubectl apply -f deployment.yaml")
+        assert d.deny_dimension == "D5"
         assert d.risk_level == "medium"
+
+    def test_kubectl_apply_with_global_flags(self):
+        d = classify_k8s_command("kubectl --context prod apply -f clusterrole.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
 
     def test_kubectl_auth_reconcile(self):
         d = classify_k8s_command("kubectl auth reconcile -f foo.yaml")
@@ -363,8 +373,8 @@ class TestDenyD8:
 class TestDefaultHitlMedium:
     """K8s family detected but neither allowlisted nor denied -> hitl medium."""
 
-    def test_kubectl_apply_default_yaml(self):
-        d = classify_k8s_command("kubectl apply foo.yaml")
+    def test_kubectl_wait_not_in_d_or_allowlist(self):
+        d = classify_k8s_command("kubectl wait pod/p1 --for=condition=Ready")
         assert d.action == "hitl"
         assert d.risk_level == "medium"
         assert d.deny_dimension is None
@@ -451,10 +461,10 @@ class TestForceEscalationSafety:
         d = classify_k8s_command("kubectl logs pod-foo --since=1h")
         assert d.action == "allow"
 
-    def test_force_with_lease_in_kubectl_apply(self):
-        d = classify_k8s_command("kubectl apply foo.yaml --force-with-lease")
-        assert d.action == "hitl"
-        assert d.risk_level == "medium"
+    def test_force_with_lease_in_kubectl_logs_still_allowlisted(self):
+        d = classify_k8s_command("kubectl logs pod-foo --force-with-lease")
+        assert d.action == "allow"
+        assert d.risk_level == "low"
         assert d.deny_dimension is None
 
     def test_force_does_not_escalate_d6(self):
@@ -552,7 +562,7 @@ class TestReasonAndMatchPropagation:
         assert "kubectl delete" in d.matched_text
 
     def test_default_hitl_reason_explains_default(self):
-        d = classify_k8s_command("kubectl apply foo.yaml")
+        d = classify_k8s_command("kubectl wait pod/p1 --for=condition=Ready")
         assert d.reason is not None
         assert "default HITL medium" in d.reason or "DIRECTIONS" in d.reason
 
@@ -561,3 +571,283 @@ class TestReasonAndMatchPropagation:
         assert d.reason is None
         assert d.matched_text is None
         assert d.deny_dimension is None
+
+
+class TestGlobalFlagTolerance:
+    """Oracle-flagged regression: global kubectl flags must not bypass deny classification.
+
+    Real commands frequently include --context / -n / --kubeconfig / --as before
+    the verb. Each deny dimension must still match in those cases.
+    """
+
+    def test_kubectl_context_then_exec_is_d7_high(self):
+        d = classify_k8s_command("kubectl --context prod exec foo")
+        assert d.deny_dimension == "D7"
+        assert d.risk_level == "high"
+
+    def test_kubectl_context_namespace_then_exec_is_d7_high(self):
+        d = classify_k8s_command("kubectl --context prod -n ns1 exec foo")
+        assert d.deny_dimension == "D7"
+        assert d.risk_level == "high"
+
+    def test_kubectl_context_then_delete_ns_is_d6_high(self):
+        d = classify_k8s_command("kubectl --context staging delete ns foo")
+        assert d.deny_dimension == "D6"
+        assert d.risk_level == "high"
+
+    def test_kubectl_namespace_then_delete_ns_is_d6_high(self):
+        d = classify_k8s_command("kubectl -n prod delete ns production")
+        assert d.deny_dimension == "D6"
+        assert d.risk_level == "high"
+
+    def test_kubectl_context_then_drain_is_d4(self):
+        d = classify_k8s_command("kubectl --context prod drain node1")
+        assert d.deny_dimension == "D4"
+        assert d.risk_level == "medium"
+
+    def test_kubectl_context_then_edit_is_d8(self):
+        d = classify_k8s_command("kubectl --context prod edit deployment x")
+        assert d.deny_dimension == "D8"
+
+    def test_kubectl_context_then_apply_clusterrole_is_d5_high(self):
+        d = classify_k8s_command("kubectl --context prod apply -f clusterrole.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_kubectl_context_then_apply_no_clusterrole_is_d5_medium(self):
+        d = classify_k8s_command("kubectl --context prod apply -f deployment.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_helm_kube_context_then_uninstall_is_d2(self):
+        d = classify_k8s_command("helm uninstall --kube-context prod my-release")
+        assert d.deny_dimension == "D2"
+
+    def test_argocd_global_flags_then_sync_is_d5(self):
+        d = classify_k8s_command("argocd --grpc-web app sync my-app")
+        assert d.deny_dimension == "D5"
+
+
+class TestClusterRoleEscalation:
+    """Oracle-flagged regression: ClusterRole modification is unconditionally high.
+
+    DIRECTIONS.md Phase 1: 'high: 3/3 (永远 N-of-M,无视角色 — 含 namespace 删除、
+    ClusterRole 修改、--force 删除、D7 全族)'.
+    """
+
+    def test_apply_clusterrole_yaml_high(self):
+        d = classify_k8s_command("kubectl apply -f clusterrole.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_apply_clusterrole_pattern_in_filename_high(self):
+        d = classify_k8s_command("kubectl apply -f my-clusterrole-binding.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_auth_reconcile_with_clusterrole_high(self):
+        d = classify_k8s_command("kubectl auth reconcile -f clusterrole.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_apply_cluster_word_alone_is_medium(self):
+        d = classify_k8s_command("kubectl apply -f cluster.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_apply_deployment_medium(self):
+        d = classify_k8s_command("kubectl apply -f deployment.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+
+class TestD2Analogues:
+    """Oracle-flagged regression: DIRECTIONS.md § Phase 1 § D2 explicit analogues:
+
+    'cilium policy import / istioctl install 走 D2 卸载类比照'.
+    """
+
+    def test_cilium_policy_import_is_d2(self):
+        d = classify_k8s_command("cilium policy import")
+        assert d.deny_dimension == "D2"
+        assert d.risk_level == "medium"
+
+    def test_istioctl_install_is_d2(self):
+        d = classify_k8s_command("istioctl install")
+        assert d.deny_dimension == "D2"
+        assert d.risk_level == "medium"
+
+    def test_istioctl_install_with_kubecontext(self):
+        d = classify_k8s_command("istioctl --kubecontext prod install")
+        assert d.deny_dimension == "D2"
+        assert d.risk_level == "medium"
+
+    def test_istioctl_manifest_apply_not_d2(self):
+        d = classify_k8s_command("istioctl manifest apply -f gateway.yaml")
+        assert d.deny_dimension is None
+
+    def test_istioctl_analyze_still_allowlisted(self):
+        d = classify_k8s_command("istioctl analyze --use-kubeconfig")
+        assert d.action == "allow"
+
+
+class TestFlagToleranceComprehensive:
+    """Comprehensive global flag combinations across all deny dimensions."""
+
+    def test_kubectl_as_then_exec_is_d7(self):
+        d = classify_k8s_command("kubectl --as system:serviceaccount:default:foo exec p -- ls")
+        assert d.deny_dimension == "D7"
+        assert d.risk_level == "high"
+
+    def test_kubectl_kubeconfig_then_port_forward_is_d7(self):
+        d = classify_k8s_command("kubectl --kubeconfig /tmp/kc port-forward svc/s 8080:80")
+        assert d.deny_dimension == "D7"
+
+    def test_kubectl_server_then_proxy_is_d7(self):
+        d = classify_k8s_command("kubectl --server https://prod:6443 proxy")
+        assert d.deny_dimension == "D7"
+
+    def test_helm_global_then_install_default_hitl(self):
+        d = classify_k8s_command("helm install --kube-context prod r1 stable/chart")
+        assert d.action == "hitl"
+        assert d.risk_level == "medium"
+        assert d.deny_dimension is None
+
+    def test_helm_namespace_flag_passthrough_uninstall(self):
+        d = classify_k8s_command("helm -n kube-system uninstall r1")
+        assert d.deny_dimension == "D2"
+
+    def test_argocd_global_flag_before_app_subcommand(self):
+        d = classify_k8s_command("argocd --grpc-web app get my-app --kubecontext prod")
+        assert d.action == "hitl"
+        assert d.family == "argocd"
+
+    def test_flux_kubecontext_then_get_allowlisted(self):
+        d = classify_k8s_command("flux --kubeconfig /tmp/k get kustomizations")
+        assert d.action == "allow"
+
+    def test_kubectl_multiple_global_flags_then_delete(self):
+        d = classify_k8s_command(
+            "kubectl --context prod --as system:mgr --namespace staging delete pod foo"
+        )
+        assert d.deny_dimension == "D1"
+        assert d.risk_level == "medium"
+
+    def test_kubectl_multiple_global_flags_then_delete_ns(self):
+        d = classify_k8s_command(
+            "kubectl --context prod --as system:mgr --namespace staging delete ns production"
+        )
+        assert d.deny_dimension == "D6"
+        assert d.risk_level == "high"
+
+    def test_kubectl_global_then_get_passthrough(self):
+        d = classify_k8s_command("kubectl --context prod get pods")
+        assert d.action == "allow"
+        assert d.family == "kubectl"
+
+    def test_kubectl_global_then_logs_passthrough(self):
+        d = classify_k8s_command("kubectl --context prod logs pod-foo")
+        assert d.action == "allow"
+
+
+class TestClusterRoleFilenameVariations:
+    """Comprehensive ClusterRole filename patterns."""
+
+    def test_clusterrole_yaml_in_subdir(self):
+        d = classify_k8s_command("kubectl apply -f rbac/cluster-role.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_clusterrole_yaml_absolute_path(self):
+        d = classify_k8s_command("kubectl apply -f /etc/rbac/clusterrole.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_clusterrole_yaml_url(self):
+        d = classify_k8s_command(
+            "kubectl apply -f https://example.com/k8s/cluster-role.yaml"
+        )
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "high"
+
+    def test_clusterrole_rolebinding_yaml(self):
+        d = classify_k8s_command("kubectl apply -f rolebinding-cluster.yaml")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_apply_clusterrole_inline_yaml_heredoc_data(self):
+        d = classify_k8s_command(
+            "kubectl apply -f - <<EOF\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nEOF"
+        )
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+
+class TestQuoteAndHeredocSafetyUnderFlags:
+    """Quoted / heredoc safety must hold even with global flags."""
+
+    def test_global_flag_with_quoted_deny_content(self):
+        d = classify_k8s_command("kubectl --context prod logs pod 'kubectl delete p'")
+        assert d.action == "allow"
+
+    def test_global_flag_with_heredoc_safety(self):
+        cmd = "kubectl --context prod apply -f - <<EOF\ndelete pod foo\nEOF"
+        d = classify_k8s_command(cmd)
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_clusterrole_in_quoted_string_does_not_escalate(self):
+        d = classify_k8s_command("kubectl apply 'clusterrole.yaml'")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_double_quote_with_deny_does_not_match(self):
+        d = classify_k8s_command('kubectl --context prod logs pod "kubectl delete p"')
+        assert d.action == "allow"
+
+
+class TestEdgeCasesExpanded:
+    """Additional edge cases for Phase 1 hardening."""
+
+    def test_empty_global_flag_value(self):
+        d = classify_k8s_command("kubectl --context= delete pod foo")
+        assert d.deny_dimension == "D1"
+
+    def test_global_flag_with_equals_syntax(self):
+        d = classify_k8s_command("kubectl --context=prod delete ns production")
+        assert d.deny_dimension == "D6"
+        assert d.risk_level == "high"
+
+    def test_kubectl_long_flag_with_equals(self):
+        d = classify_k8s_command("kubectl --namespace=staging get pods")
+        assert d.action == "allow"
+
+    def test_istioctl_install_with_manifest_apply_does_not_match_d2(self):
+        d = classify_k8s_command("istioctl manifest apply")
+        assert d.deny_dimension is None
+        assert d.deny_dimension is None
+
+    def test_cilium_policy_get_is_not_d2(self):
+        d = classify_k8s_command("cilium policy get")
+        assert d.deny_dimension is None
+
+    def test_krew_search_with_context_flag_limitation(self):
+        d = classify_k8s_command("kubectl --context prod krew search")
+        assert d.action == "hitl"
+        assert d.family == "kubectl"
+
+    def test_krew_install_with_context_flag(self):
+        d = classify_k8s_command("kubectl --context prod krew install foo")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_kubectl_auth_reconcile_with_empty_yaml(self):
+        d = classify_k8s_command("kubectl auth reconcile -f /dev/null")
+        assert d.deny_dimension == "D5"
+        assert d.risk_level == "medium"
+
+    def test_multiline_command_with_global_flags(self):
+        cmd = "kubectl --context prod \\\n  delete ns foo"
+        d = classify_k8s_command(cmd)
+        assert d.action == "hitl"
+        assert d.family == "kubectl"
