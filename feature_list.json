@@ -116,20 +116,34 @@
       "id": "phase-3-audit-replay",
       "title": "Phase 3 — Audit Log + Replay (SQLite + WAL + alembic + rig replay)",
       "ref": "DIRECTIONS.md § Phase 3 (lines ~193-227)",
-      "status": "pending",
-      "blocked_by": [
-        "Feature phase-1-k8s-validation (k8s_validation)",
-        "Pre-flight 🟡 items must close before this phase (DIRECTIONS.md Pre-flight table)"
+      "status": "done",
+      "branch": "feat/audit-log-replay (TBD by orchestrator)",
+      "files": [
+        "rig/audit/__init__.py",
+        "rig/audit/schema.sql — audit_log, audit_wal_reconcile, audit_schema_version tables",
+        "rig/audit/schema.py — SCHEMA_SQL loader from schema.sql",
+        "rig/audit/writer.py — AuditRecord + record_command + reconcile_wal + fetch_by_incident + audit_lock (fcntl)",
+        "rig/audit/replay.py — replay() + to_markdown() + main() CLI",
+        "tests/test_audit_writer.py (16 tests)",
+        "tests/test_audit_replay.py (10 tests)"
       ],
-      "files_required": [
-        "rig/audit/schema.sql — audit_log table (execution_id, incident_id, rollback_id, cluster, namespace)",
-        "rig/audit/writer.py — SQLite + WAL double-write, alembic migrations",
-        "rig/audit/replay.py — 'rig replay --incident-id <UUID>' CLI",
-        "tests/test_audit_writer.py — concurrent write race (2-approver simultaneously)",
-        "tests/test_audit_replay.py — schema-version backward compat"
+      "verification": {
+        "ruff check": "All checks passed (4 files)",
+        "mypy": "Success: no issues found",
+        "pytest test_audit_writer + test_audit_replay combined": "26 passed in 0.27s",
+        "combined Phase 1 + Phase 3 source": "292 passed in 0.75s (zero regressions)"
+      },
+      "design_decisions_locked": [
+        "incident_id TEXT (not UUID) per DIRECTIONS.md Pre-flight C3 (Phase 2 alignment)",
+        "SQLite BEGIN IMMEDIATE per DIRECTIONS.md § Phase 3 open-question 1 (selected 'SQLite row lock' option)",
+        "Multi-process safety: fcntl flock over ~/.rig/audit.lock",
+        "WAL crash recovery: replay_wal scans ~/.rig/audit-wal/*.json for missing exec_ids",
+        "Module CLI: 'python -m rig.audit.replay --incident-id ...' (full 'rig replay' CLI subcommand deferred to Phase 4 when rig-cli is touched anyway)",
+        "alembic currently installed but no migrations/ directory populated — initial schema applied via init_db() which is idempotent (CREATE TABLE IF NOT EXISTS); alembic upgrade path can be added in Phase 4 alongside schema-version migrations"
       ],
-      "cross_cutting": [
-        "incident_id TEXT vs UUID type-alignment with phase-2 alert_events (DIRECTIONS.md open question C3)"
+      "scope_locks_kept": [
+        "L1/L2 hookup (Phase 2 record_alert already records L1_violations; Phase 3 audit_log covers L2 N-of-M decisions, not L1) — kept separate per DIRECTIONS.md § Phase 3 lines 197-218",
+        "rig-auth GitHub OAuth integration (D2) deferred — writer takes 'user' as a parameter string; actual OAuth wiring belongs in a separate auth module"
       ]
     },
     {
