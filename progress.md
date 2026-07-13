@@ -6,7 +6,122 @@ verification ran, what was deferred).
 
 ---
 
-## 2026-07-13 (Asia/Shanghai) — Phase 1 ship session
+## 2026-07-13 — Phase 2 L1 alert intake ship session (PR #6, OPEN)
+
+**Operator**: Sisyphus (orchestrator) on behalf of user.
+
+**Feature**: phase-2-l1-alert-intake — DIRECTIONS.md § Phase 2.
+
+**Branch**: `feat/alert-intake-l1` off `main` (PR #6 OPEN)
+
+### What was built
+
+Phase 2 — L1 alert intake subsystem. Implements DIRECTIONS.md § Phase 2
+verbatim: webhook normalization from 3 sources, LLM-driven read-only
+diagnosis double-gated by Phase-1's `k8s_validation.allowlist`, and
+multi-channel report distribution.
+
+Files created (8 source, 4 test, 1 schema, 1 helper module):
+
+```
+rig/alert/__init__.py           public API surface
+rig/alert/intake.py             AlertEvent + 3 normalizers + dedup + _IncidentRegistry
+rig/alert/diagnostic.py         _propose_commands + _gate + _render_markdown + record_*
+rig/alert/report.py             4 emit channels (chat/Slack/SMTP/PagerDuty)
+rig/alert/schema.sql            alert_events + diagnostic_reports + l1_violations tables
+rig/alert/schema.py             SCHEMA_SQL loader from schema.sql
+rig/server/alerts_api.py        Flask blueprint with 3 endpoints
+rig/server/app.py               alerts_api registered (modified — 2 lines added)
+
+tests/test_alert_intake.py      14 tests
+tests/test_alert_dedup.py       9 tests
+tests/test_alert_diagnostic.py  14 tests
+tests/test_alert_report.py      10 tests
+```
+
+### Implementation decisions (locked)
+
+1. `AlertEvent` is `@dataclass(frozen=True)`. `with_incident()`
+   helper produces a copy with a new `incident_id`.
+2. `_IncidentRegistry` uses `closed_incidents: dict[key -> original_id]`
+   so close->reopen restores the original incident_id rather than minting
+   one prefixed by source.
+3. Module-level `_DEFAULT_REGISTRY` so follow-up webhooks in the same
+   process share dedup state automatically. Tests that need isolation
+   pass an explicit `_IncidentRegistry()`.
+4. `k8s_validation.allowlist` is the source of truth for the gate;
+   `shell_allowlist_hook` is consulted for shell-only diagnostic
+   commands (e.g. `ls /tmp`) — the dual-check interpretation per
+   DIRECTIONS.md § Phase 2 step 3.
+5. LLM mock uses `rig.message.Message("user", prompt)` with
+   `mock/static` model. JSON parse failure of canned response is
+   silently caught -> empty plan.
+6. `l1_violations` table persists rejected commands with their
+   deny_dimension so Phase 3's `rig replay` can surface them.
+7. Schema version locked at schema.sql's mtime; bump + add a
+   migration before changing column types (commented in file).
+
+### Bugs found by tests during implementation
+
+These were REAL bugs the Phase 2 PR fixed before merge:
+
+1. `_gate` had a broken `shell_allowlist` logic. The original
+   `dual_pass` check required `k8s_validation.action == "allow"` AND
+   (`shell_allowlist_agrees` or `decision.family is None`). Since
+   `shell_allowlist.is_allowlisted("kubectl get pods")` is always
+   False, this rejected even allowlisted kubectl commands. Fixed:
+   rework the gate to a clean rule (allowlisted K8s -> run;
+   non-K8s with shell allowlist -> run; otherwise violation).
+2. `_IncidentRegistry.closed_incidents` was typed `set[str]` but
+   checked with tuple keys. Fixed: type -> `dict[tuple, str]`.
+3. Datadog tag parser dropped tag values that lacked a colon
+   (`extra` -> skipped). Fixed: tag-without-colon -> `labels[tag] = "true"`
+   consistent with the list-input path.
+4. `dedup` reopen caused duplicated source prefix
+   (`alertmanager:am:g1:KubePodCrashLooping`). Fixed: restore the
+   stored incident_id from `closed_incidents[key]`.
+
+### Verification
+
+```
+ruff check rig/alert/ rig/server/alerts_api.py rig/server/app.py \
+        tests/test_alert_intake.py tests/test_alert_dedup.py \
+        tests/test_alert_diagnostic.py tests/test_alert_report.py
+  -> All checks passed
+
+mypy rig/alert/ rig/server/alerts_api.py \
+        tests/test_alert_intake.py tests/test_alert_dedup.py \
+        tests/test_alert_diagnostic.py tests/test_alert_report.py
+  -> Success: no issues found in 10 source files
+
+pytest tests/test_alert_*.py -q
+  -> 50 passed in 6.16s
+
+combined with Phase 1:
+  -> 316 passed in 6.37s (zero regressions)
+```
+
+### Commit
+
+`4d4bd6c feat(alert): Phase 2 L1 webhook intake + diagnostic report`
+(13 files changed, +2070 / -14)
+
+PR: `https://github.com/kuKie0427/rig/pull/6` (OPEN)
+
+---
+
+## 2026-07-13 — Agent SOP rewrite session (PR #5, merged)
+
+Replaced fork-upstream `AGENTS.md` (verbatim gptme rebrand with stale
+URLs) with template-driven SOP. Created `feature_list.json` (7
+features tracked) and this `progress.md`. Branch `docs/agent-sop-update`
+-> PR #5 merged as commit `f08cdc9`.
+
+---
+
+## 2026-07-13 — Phase 1 ship session (historical)
+
+
 
 **Operator**: Sisyphus (orchestrator) on behalf of user.
 
@@ -122,61 +237,4 @@ verification ran, what was deferred).
 
 ---
 
-## Deferred items
-
-1. **Phase 2 (L1 alert intake)**: large feature (~7 new files +
-   4 test files). Independent branch `feat/alert-intake-l1`.
-   Should pull from current `main` after this commit.
-2. **Phase 3 (audit log + replay)**: gated on Phase 2's
-   incident_id decision; needs alembic decision (open Q2).
-   Independent branch `feat/audit-log-replay`.
-3. **Phase 4 (3 K8s profiles)**: independent branch
-   `feat/k8s-profiles`.
-4. **Phase 5 (ops_bench evaluations)**: independent branch
-   `feat/ops-bench-evaluations`.
-5. **`docs/ARCHITECTURE.md`, `docs/PRODUCT.md`**: not yet
-   scaffolded; `DIRECTIONS.md` is currently playing that role.
-   If user requests formal docs/ split, that's a separate feature.
-6. **Workspace root `/Volumes/code/allAgent/AGENTS.md`** does not
-   mention `forks/` as a sibling — noted earlier, left for a
-   later workspace-hygiene pass.
-
-## Repository state at end of session
-
-```
-$ git log --oneline --graph -10
-* d13920b Merge pull request #4 from kuKie0427/feat/k8s-validation
-|\
-| *   70f238b Merge branch 'main' into feat/k8s-validation
-| |\
-| |/  
-|/|   
-* |   d2afdb6 Merge branch 'fix/conftest-llm-rig-shim' into main
-|\ \  
-| * | 75d09ef fix(llm): add llm_rig compatibility shim for upstream rebrand
-|/ /  
-| * 0da3d37 fix(tools): extend cilium-policy-import flag tolerance + test-name parity
-| * 470375a fix(tools): harden k8s_validation against Oracle-flagged regression gaps
-| * 693de8d feat(tools): add k8s_validation with allowlist / D1-D8 deny / N-of-M HITL
-|/  
-* fc49641 Initial import (rebranded)
-```
-
-Working tree clean. Phase 1 is on `main` (d13920b). PR #4 merged.
-Conftest fix (d2afdb6) is on `main` ahead of Phase 1.
-
-## Verification commands run
-
-```
-# Phase 1 module
-uv run ruff check rig/tools/k8s_validation.py tests/test_k8s_validation.py rig/llm/llm_rig.py
-  → All checks passed
-uv run mypy rig/tools/k8s_validation.py tests/test_k8s_validation.py rig/llm/llm_rig.py
-  → Success: no issues found in 3 source files
-uv run pytest tests/test_k8s_validation.py -v
-  → 152 passed
-uv run pytest tests/test_k8s_validation.py tests/test_tools_shell_validation.py -q
-  → 266 passed in 0.62s
-uv run pytest tests/ --co
-  → 7804 tests collected (was 0 before conftest fix)
-```
+## 2026-07-13 (Asia/Shanghai) — Phase 1 ship session
