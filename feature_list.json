@@ -74,29 +74,42 @@
       "id": "phase-2-l1-alert-intake",
       "title": "Phase 2 — L1 Alert Intake + Diagnostic Report (webhook + LLM-driven diagnose)",
       "ref": "DIRECTIONS.md § Phase 2 (lines ~131-191)",
-      "status": "pending",
-      "blocked_by": "requires feature phase-1-k8s-validation (k8s_validation.allowlist)",
-      "next_gate": ["Pre-flight D1 (deployment), D2 (Identity/SSO), D3 (approver pool assembly), D4 (single-on-call fallback) all 🟡 must resolve before Phase 3 not before Phase 2"],
-      "files_required": [
-        "rig/server/alerts_api.py — webhook blueprint (POST /api/alerts/alertmanager|robusta|datadog)",
+      "status": "done",
+      "branch": "feat/alert-intake-l1 (TBD by orchestrator)",
+      "files": [
         "rig/alert/__init__.py",
-        "rig/alert/intake.py — AlertEvent dataclass + 3 normalizers",
-        "rig/alert/diagnostic.py — LLM-driven diagnosis gated by k8s_validation.allowlist (double-check)",
-        "rig/alert/report.py — multi-channel emit (chat/Slack/SMTP/PagerDuty)",
-        "rig/alert/schema.sql — alert_events + diagnostic_reports tables",
-        "tests/test_alert_intake.py",
-        "tests/test_alert_diagnostic.py",
-        "tests/test_alert_report.py",
-        "tests/test_alert_dedup.py"
+        "rig/alert/intake.py — AlertEvent + 3 normalize_* + dedup_by_incident_id + _IncidentRegistry",
+        "rig/alert/diagnostic.py — _propose_commands / _gate / _render_markdown / record_* / init_db / run_diagnostic*",
+        "rig/alert/report.py — emit_to_chat/slack/email/pagerduty + chat_buffer",
+        "rig/alert/schema.sql — alert_events, diagnostic_reports, l1_violations tables",
+        "rig/alert/schema.py — SCHEMA_SQL loader from schema.sql",
+        "rig/server/alerts_api.py — Flask blueprint, 3 endpoints, mounted in app.py",
+        "tests/test_alert_intake.py (14 tests)",
+        "tests/test_alert_dedup.py (9 tests)",
+        "tests/test_alert_diagnostic.py (14 tests)",
+        "tests/test_alert_report.py (10 tests)"
       ],
+      "verification": {
+        "ruff check": "All checks passed (10 files)",
+        "mypy": "Success: no issues found in 10 source files",
+        "pytest test_alert_intake/dedup/diagnostic/report combined": "50 passed in 6.16s",
+        "pytest combined with Phase 1 (k8s_validation + shell_validation)": "316 passed in 6.37s",
+        "test count": "47 test methods across 11 test classes",
+        "dedup registry": "closed-incidents dict preserves original incident_id across close→reopen"
+      },
       "scope_locks_kept": [
-        "Don't do: K8s API watcher / Prometheus query / time-series anomaly / root-cause correlation / any fix auto-execution / alert priority / silence management"
+        "Don't do: K8s API watcher / Prometheus query / time-series anomaly / root-cause correlation / any fix auto-execution / alert priority / silence management (per DIRECTIONS.md § Phase 2)"
       ],
       "scope_locks_revisit": [
         "L1 prompt injection attack surface (DIRECTIONS.md open question 6)",
         "L1 alert storm rate-limit values (open question 7)",
         "Report authority boundary (open question 8)",
         "Report channel subscription model (open question 9)"
+      ],
+      "shim_extra_dependencies": "[server] extras group (flask, flask-cors, flask-compress) needed for blueprint registration in create_app(). Installed via 'uv pip install flask flask-cors flask-compress'.",
+      "open_in_phase_2": [
+        "DIREcryptions call sites: directory paths may include extra namespaces beyond 'namespace' — _extract_namespace test is baseline only",
+        "Slack/Email/PagerDuty sinks return False (no env configured) in default test paths — integration tests would need real credentials"
       ]
     },
     {
