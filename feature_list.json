@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "project": "rig",
+  "description": "Fork of gptme (MIT) rebranded for Kubernetes platform teams. Implements DIRECTIONS.md § Phase 1-5.",
+  "upstream_rebrand_compat": "rig.llm.llm_rig shim → rig.llm.llm_gptme",
+  "branch_model": "one branch per DIRECTIONS.md phase; --no-ff merge into main; one PR per phase",
+  "features": [
+    {
+      "id": "phase-1-k8s-validation",
+      "title": "Phase 1 — rig/tools/k8s_validation.py (allowlist + D1-D8 deny + N-of-M HITL)",
+      "ref": "DIRECTIONS.md § Phase 1 (lines ~88-128)",
+      "status": "done",
+      "branch": "feat/k8s-validation (merged into main)",
+      "pr": "#4",
+      "merged_at": "2026-07-13",
+      "files": [
+        "rig/tools/k8s_validation.py (503 LOC)",
+        "tests/test_k8s_validation.py (858 LOC, 152 tests, 21 classes)"
+      ],
+      "verification": {
+        "uv run pytest tests/test_k8s_validation.py tests/test_tools_shell_validation.py -q": "266 passed in 0.62s",
+        "uv run ruff check rig/tools/k8s_validation.py tests/test_k8s_validation.py rig/llm/llm_rig.py": "All checks passed",
+        "uv run mypy rig/tools/k8s_validation.py tests/test_k8s_validation.py rig/llm/llm_rig.py": "Success: no issues found",
+        "uv run pytest tests/test_k8s_validation.py -v": "152 passed",
+        "oracle_iterations": 3,
+        "oracle_final_verdict": "COMPLETE"
+      },
+      "implementation_commits": [
+        "693de8d feat(tools): add k8s_validation with allowlist / D1-D8 deny / N-of-M HITL",
+        "470375a fix(tools): harden k8s_validation against Oracle-flagged regression gaps",
+        "0da3d37 fix(tools): extend cilium-policy-import flag tolerance + test-name parity"
+      ]
+    },
+    {
+      "id": "rebrand-fix-conftest",
+      "title": "Upstream rebrand compatibility shim — rig/llm/llm_rig.py",
+      "ref": "DIRECTIONS.md PR scope cleanup (Phase 0 / cross-cutting)",
+      "status": "done",
+      "branch": "fix/conftest-llm-rig-shim (merged into main)",
+      "pr": "(merged via d2afdb6 ahead of #4; no standalone PR opened)",
+      "merged_at": "2026-07-13",
+      "files": [
+        "rig/llm/llm_rig.py (54 LOC, 16 re-exported symbols)"
+      ],
+      "verification": {
+        "rig.init loads": "OK (was ModuleNotFoundError)",
+        "tests/conftest.py collects": "OK (was broken)",
+        "uv run ruff check rig/llm/llm_rig.py": "All checks passed",
+        "uv run mypy rig/llm/llm_rig.py": "Success",
+        "uv run pytest tests/ --co": "7804 tests collected (was 0)"
+      },
+      "rationale": "Without this shim, 'make test' / 'pytest tests/' fails at conftest collection because tests/conftest.py imports rig.init, which imports rig.llm.llm_rig (the pre-rebrand name). The shim is the minimum-blast-radius fix; deletion criterion is documented inline: once 'grep -rn llm_rig rig/ tests/' returns zero hits, the shim can be removed."
+    },
+    {
+      "id": "agent-sop-docs",
+      "title": "Agent SOP rewrite — AGENTS.md + feature_list.json + progress.md",
+      "ref": "ultrawork / Sisyphus orchestrator template",
+      "status": "done",
+      "branch": "docs/agent-sop (TBD by orchestrator)",
+      "files": [
+        "AGENTS.md",
+        "feature_list.json (this file)",
+        "progress.md",
+        "AGENTS.md.upstream-gptme-bak (preserved upstream fork content)"
+      ],
+      "verification": {
+        "feature_list.json parses": "7 features; 2 done, 4 pending, 1 done (this entry)",
+        "ag_state_sync": "AGENTS.md / feature_list.json / progress.md render cleanly (cat-readable, valid JSON)",
+        "uv run pytest tests/test_k8s_validation.py tests/test_tools_shell_validation.py -q": "266 passed in 0.58s (no regression)"
+      },
+      "rationale": "Replace upstream-fork AGENTS.md (which is a verbatim gptme rebrand with stale upstream-doc URLs) with the template-driven SOP that matches the multi-phase DIRECTIONS.md planning model."
+    },
+    {
+      "id": "phase-2-l1-alert-intake",
+      "title": "Phase 2 — L1 Alert Intake + Diagnostic Report (webhook + LLM-driven diagnose)",
+      "ref": "DIRECTIONS.md § Phase 2 (lines ~131-191)",
+      "status": "pending",
+      "blocked_by": "requires feature phase-1-k8s-validation (k8s_validation.allowlist)",
+      "next_gate": ["Pre-flight D1 (deployment), D2 (Identity/SSO), D3 (approver pool assembly), D4 (single-on-call fallback) all 🟡 must resolve before Phase 3 not before Phase 2"],
+      "files_required": [
+        "rig/server/alerts_api.py — webhook blueprint (POST /api/alerts/alertmanager|robusta|datadog)",
+        "rig/alert/__init__.py",
+        "rig/alert/intake.py — AlertEvent dataclass + 3 normalizers",
+        "rig/alert/diagnostic.py — LLM-driven diagnosis gated by k8s_validation.allowlist (double-check)",
+        "rig/alert/report.py — multi-channel emit (chat/Slack/SMTP/PagerDuty)",
+        "rig/alert/schema.sql — alert_events + diagnostic_reports tables",
+        "tests/test_alert_intake.py",
+        "tests/test_alert_diagnostic.py",
+        "tests/test_alert_report.py",
+        "tests/test_alert_dedup.py"
+      ],
+      "scope_locks_kept": [
+        "Don't do: K8s API watcher / Prometheus query / time-series anomaly / root-cause correlation / any fix auto-execution / alert priority / silence management"
+      ],
+      "scope_locks_revisit": [
+        "L1 prompt injection attack surface (DIRECTIONS.md open question 6)",
+        "L1 alert storm rate-limit values (open question 7)",
+        "Report authority boundary (open question 8)",
+        "Report channel subscription model (open question 9)"
+      ]
+    },
+    {
+      "id": "phase-3-audit-replay",
+      "title": "Phase 3 — Audit Log + Replay (SQLite + WAL + alembic + rig replay)",
+      "ref": "DIRECTIONS.md § Phase 3 (lines ~193-227)",
+      "status": "pending",
+      "blocked_by": [
+        "Feature phase-1-k8s-validation (k8s_validation)",
+        "Pre-flight 🟡 items must close before this phase (DIRECTIONS.md Pre-flight table)"
+      ],
+      "files_required": [
+        "rig/audit/schema.sql — audit_log table (execution_id, incident_id, rollback_id, cluster, namespace)",
+        "rig/audit/writer.py — SQLite + WAL double-write, alembic migrations",
+        "rig/audit/replay.py — 'rig replay --incident-id <UUID>' CLI",
+        "tests/test_audit_writer.py — concurrent write race (2-approver simultaneously)",
+        "tests/test_audit_replay.py — schema-version backward compat"
+      ],
+      "cross_cutting": [
+        "incident_id TEXT vs UUID type-alignment with phase-2 alert_events (DIRECTIONS.md open question C3)"
+      ]
+    },
+    {
+      "id": "phase-4-k8s-profiles",
+      "title": "Phase 4 — K8s Profiles (inspector / deployer / admin)",
+      "ref": "DIRECTIONS.md § Phase 4 (lines ~229-245)",
+      "status": "pending",
+      "blocked_by": "requires phase-1-k8s-validation (allowlist + N-of-M) for tool-access gating",
+      "files_required": [
+        "rig/profiles/inspector.py — read-only allowlist full set",
+        "rig/profiles/deployer.py — + apply / helm upgrade / argocd sync / flux reconcile / krew install",
+        "rig/profiles/admin.py — full 7-CLI-family power; D6/D5/--force still gated high N-of-M",
+        "tests/test_profiles.py — inspector calling deployer tools fails"
+      ],
+      "decision_locked": "Tool set definitions hard-coded in Python (no YAML config layer) until 5+ profile count; per DIRECTIONS.md § Phase 4 + design principle 3"
+    },
+    {
+      "id": "phase-5-ops-bench",
+      "title": "Phase 5 — ops_bench evaluation suite (4 mock-LLM regressions)",
+      "ref": "DIRECTIONS.md § Phase 5 (lines ~247-265)",
+      "status": "pending",
+      "files_required": [
+        "rig/eval/ops_bench/danger_block.py — 150 high-risk command cases, 100% interception",
+        "rig/eval/ops_bench/alert_intake_fidelity.py — 50 alert payload cases, 0% overreach",
+        "rig/eval/ops_bench/plan_adherence.py — 50 incident descriptions, edit-distance threshold",
+        "rig/eval/ops_bench/transfer_recall.py — 50 escalation cases, 90% recall"
+      ],
+      "scope_decisions_open": [
+        "transfer_recall corpus provenance (DIRECTIONS.md open question 4)",
+        "tolerance by magnitude classification — algorithm TBD (open question F4)"
+      ]
+    }
+  ],
+  "open_questions_global": {
+    "L1-related (Phase 2)": [
+      "L1-9: LLM prompt injection attack surface mitigation (open question 6)",
+      "L1-7: alert storm rate-limit values (open question 7)",
+      "L1-8: report authority boundary — engineer I-check required? (open question 8)",
+      "L1-9: report channel subscription model — namespace? cluster? deny_group? (open question 9)"
+    ],
+    "global": [
+      "Q1: N-of-M concurrency race — SQLite BEGIN IMMEDIATE vs Redis SETNX?",
+      "Q2: Audit schema cross-version migration — alembic vs hand-rolled?",
+      "Q3: Profile tool-set definition — Python source vs YAML config?"
+    ]
+  },
+  "preflight_status": {
+    "A1_deployment": "✅ locked (D1)",
+    "A2_identity": "✅ locked (D2)",
+    "A3_approver_pool": "✅ locked (D3)",
+    "A4_fallback": "✅ locked (D4)",
+    "A5_data_scale": "🟡 SQLite v1, half-year-out Postgres upgrade (Phase 3 scope)",
+    "A6_topology": "✅ locked (D1)",
+    "B1_framework_enforcement": "✅ framework post-processor will enforce (not prompt-soft)",
+    "B2_mock_llm_fastpath": "✅ mock-LLM fast + real-LLM nightly dual-track",
+    "B3_decisions_open": "🟡 L1-9 + transfer_recall corpus left explicit in feature_list.json",
+    "B4_soft_v_hard": "✅ DIRECTIONS.md § 设计原则 5 names hard rule",
+    "C1_usage_table_v_framework": "✅ k8s_validation IS the framework intercept layer",
+    "C2_sandbox_escape_paths": "✅ D7 (4 paths) + D8 (2 paths) + 5+ K8s CLI families documented",
+    "C3_phase_interfaces": "🟡 Phase-2 alert_events.incident_id TEXT vs Phase-3 audit_log.incident_id UUID ALIGNED at TEXT (per DIRECTIONS.md C3)",
+    "C4_concurrency_model": "✅ SQLite WAL + BEGIN IMMEDIATE row lock, single-replica deployment",
+    "D1_verification": "✅ Robusta / NIST SP 800-61 Rev. 3 / SRE Book Ch.14 / RBAC spec / Robusta not-L1+L2 etc. cited; smolagents BibTeX 2025; RAGAS 4 authors; updated 2026-07-13",
+    "D2_scope": "✅ L0/Prometheus, L1/intake here, L3/SRE elsewhere",
+    "D3_no_invented_terms": "✅ n/a (no new terms in DIRECTIONS.md)",
+    "E1_failure_modes": "✅ 7 failure modes enumerated (approval fatigue + RBAC + race + multi-cluster + LLM-bounds + alert-storm + diagnostic-distortion)",
+    "E2_layer_split": "🟡 engineering-layer dominant; operations-layer single-on-call D4 captured but multi-cluster ops split not yet dedicated",
+    "E3_mitigations": "✅ each ⚠️ has concrete mitigation",
+    "F1_mock_v_real": "✅ mock-fast + real-nightly dual-track",
+    "F2_corpus_provenance": "🟡 Phase-5 will mark per-case source; corpus list TBD in Phase-5 PR",
+    "F4_failure_attribution": "🟡 Phase-5 will classify (intent / SQL / tool / reasoning); algorithm TBD"
+  }
+}
